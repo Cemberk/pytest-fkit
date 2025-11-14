@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+setup.py
+pytest_fkit/__init__.py
+pytest_fkit/plugin.py
+pytest_fkit.egg-info/PKG-INFO
+pytest_fkit.egg-info/SOURCES.txt
+pytest_fkit.egg-info/dependency_links.txt
+pytest_fkit.egg-info/entry_points.txt
+pytest_fkit.egg-info/requires.txt
+pytest_fkit.egg-info/top_level.txt
