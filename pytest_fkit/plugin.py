@@ -84,6 +84,11 @@ class CrashIsolationPlugin:
         """Run a single test in an isolated subprocess."""
         import pickle
         import tempfile
+        import xml.etree.ElementTree as ET
+
+        # Create temp file for JUnit XML output to capture actual test results
+        junit_fd, junit_path = tempfile.mkstemp(suffix='.xml', prefix='fkit_')
+        os.close(junit_fd)
 
         # Create a script that will run just this test
         # IMPORTANT: Disable fkit plugin in subprocess using PYTEST_DISABLE_PLUGIN_AUTOLOAD
@@ -96,7 +101,7 @@ os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
 
 import pytest
 
-# Run the test without fkit plugin
+# Run the test without fkit plugin and capture results in JUnit XML
 exit_code = pytest.main([
     '{item.nodeid}',
     '-v',
@@ -104,6 +109,7 @@ exit_code = pytest.main([
     '--continue-on-collection-errors',
     '-p', 'no:cacheprovider',
     '-p', 'no:fkit',  # Explicitly disable fkit
+    '--junitxml={junit_path}',  # Capture actual test results
 ])
 
 sys.exit(exit_code)
@@ -135,10 +141,31 @@ sys.exit(exit_code)
                 stop_time = time.time()
                 duration = stop_time - start_time
 
-                # Determine outcome based on return code
+                # Parse JUnit XML to get actual test outcome (passed/failed/skipped)
+                test_outcome = self._parse_junit_result(junit_path, item.nodeid)
+
+                # Determine outcome based on return code and JUnit XML
                 if result.returncode == 0:
-                    # Test passed
-                    return self._make_report(item, "call", "passed", duration=duration)
+                    # Subprocess exited cleanly - check actual test result from JUnit XML
+                    if test_outcome == 'skipped':
+                        # Test was skipped - preserve the skip!
+                        skip_reason = self._get_skip_reason(junit_path, item.nodeid)
+                        return self._make_report(
+                            item, "call", "skipped",
+                            longrepr=(None, None, skip_reason or "Skipped"),
+                            duration=duration
+                        )
+                    elif test_outcome == 'passed':
+                        # Test passed
+                        return self._make_report(item, "call", "passed", duration=duration)
+                    else:
+                        # Test failed normally (but returned 0? shouldn't happen but handle it)
+                        fail_info = f"\n--- STDOUT ---\n{result.stdout}\n\n--- STDERR ---\n{result.stderr}"
+                        return self._make_report(
+                            item, "call", "failed",
+                            longrepr=fail_info,
+                            duration=duration
+                        )
 
                 elif result.returncode < 0:
                     # Process was killed by signal (CRASH!)
@@ -205,11 +232,73 @@ sys.exit(exit_code)
                 )
 
         finally:
-            # Clean up temp script
+            # Clean up temp files
             try:
                 os.unlink(script_path)
             except:
                 pass
+            try:
+                os.unlink(junit_path)
+            except:
+                pass
+
+    def _parse_junit_result(self, junit_path, nodeid):
+        """Parse JUnit XML to get the actual test outcome."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            if not os.path.exists(junit_path):
+                return 'unknown'
+
+            tree = ET.parse(junit_path)
+            root = tree.getroot()
+
+            # Find the testcase element for this nodeid
+            for testcase in root.findall('.//testcase'):
+                # Match by test name (simple heuristic - could be improved)
+                classname = testcase.get('classname', '')
+                name = testcase.get('name', '')
+
+                # Check if skipped
+                if testcase.find('skipped') is not None:
+                    return 'skipped'
+
+                # Check if failed
+                if testcase.find('failure') is not None or testcase.find('error') is not None:
+                    return 'failed'
+
+                # Otherwise passed
+                return 'passed'
+
+            return 'unknown'
+        except Exception as e:
+            # If we can't parse JUnit, assume passed for returncode 0
+            return 'unknown'
+
+    def _get_skip_reason(self, junit_path, nodeid):
+        """Extract skip reason from JUnit XML."""
+        import xml.etree.ElementTree as ET
+
+        try:
+            if not os.path.exists(junit_path):
+                return "Skipped"
+
+            tree = ET.parse(junit_path)
+            root = tree.getroot()
+
+            # Find the testcase element
+            for testcase in root.findall('.//testcase'):
+                skipped = testcase.find('skipped')
+                if skipped is not None:
+                    # Get skip reason from message attribute or text
+                    reason = skipped.get('message', None)
+                    if not reason:
+                        reason = skipped.text
+                    return reason or "Skipped"
+
+            return "Skipped"
+        except Exception:
+            return "Skipped"
 
     def _make_report(self, item, when, outcome, longrepr=None, duration=0, crash=False, timeout=False):
         """Create a test report."""

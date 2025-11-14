@@ -22,7 +22,7 @@ Dynamic: requires-python
 
 **F**ix **K**rashes **I**n **T**ests - A pytest plugin that prevents crashes from killing your entire test suite.
 
-Inspired by the (joke) library [fkitpy](https://github.com/nvbn/fkitpy), pytest-fkit takes a more practical approach: when a test crashes Python (SIGABRT, SIGSEGV, etc.), it catches the crash and converts it to a normal pytest ERROR instead of killing your entire test run.
+When a test crashes Python (SIGABRT, SIGSEGV, etc.), it catches the crash and converts it to a normal pytest ERROR instead of killing your entire test run.
 
 ## The Problem
 
@@ -74,26 +74,9 @@ Set a timeout per test (default is 600 seconds / 10 minutes):
 pytest --fkit --fkit-timeout=300  # 5 minute timeout per test
 ```
 
-### In Priority Bucketing Script
-
-Update your `transformers_ut.sh` or `priority_bucketing.py` to use pytest-fkit:
-
 ```bash
 # In transformers_ut.sh
 pytest --fkit --fkit-timeout=600 tests/
-```
-
-Or in `priority_bucketing.py`:
-```python
-pytest_args = [
-    *execution_targets,
-    "-v",
-    "--fkit",  # Enable crash protection
-    "--fkit-timeout=600",
-    f"--junitxml={junit}",
-    "--tb=short",
-    # ... other args
-]
 ```
 
 ### Skip Crash Isolation for Specific Tests
@@ -152,7 +135,7 @@ tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_backward PASSED
 - **Best For**: Large test suites where crashes are occasional but catastrophic
 - **Not Recommended**: Tiny test suites with < 100 tests where crashes are rare
 
-For the HuggingFace Transformers test suite with 30,000+ tests, the overhead is worth it to ensure all tests run to completion.
+For the HuggingFace Transformers test suite with 100,000+ tests, the overhead is worth it to ensure all tests run to completion.
 
 ## Configuration
 
@@ -179,8 +162,3 @@ addopts = ["--fkit", "--fkit-timeout=600"]
 ## License
 
 MIT
-
-## Credits
-
-- Inspired by [fkitpy](https://github.com/nvbn/fkitpy) by Vladimir Iakovlev
-- Built for the AI Software Ecosystem (AISE) testing infrastructure
