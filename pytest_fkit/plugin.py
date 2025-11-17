@@ -91,24 +91,20 @@ class CrashIsolationPlugin:
         os.close(junit_fd)
 
         # Create a script that will run just this test
-        # IMPORTANT: Disable fkit plugin in subprocess using PYTEST_DISABLE_PLUGIN_AUTOLOAD
+        # The -p no:fkit flag ensures fkit doesn't run recursively
         test_script = f"""
 import sys
-import os
-
-# Disable fkit plugin in subprocess to prevent recursion
-os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
-
 import pytest
 
 # Run the test without fkit plugin and capture results in JUnit XML
+# Environment variables are inherited from parent process
 exit_code = pytest.main([
     '{item.nodeid}',
     '-v',
     '--tb=short',
     '--continue-on-collection-errors',
     '-p', 'no:cacheprovider',
-    '-p', 'no:fkit',  # Explicitly disable fkit
+    '-p', 'no:fkit',  # Explicitly disable fkit to prevent recursion
     '--junitxml={junit_path}',  # Capture actual test results
 ])
 
@@ -125,9 +121,19 @@ sys.exit(exit_code)
             start_time = time.time()
 
             try:
-                # Prepare environment - disable fkit in subprocess
+                # Prepare environment - inherit ALL environment variables
+                # No need to set PYTEST_DISABLE_PLUGIN_AUTOLOAD since we use -p no:fkit in command
                 env = os.environ.copy()
-                env['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'
+
+                # Explicitly ensure critical variables are set if they exist
+                # (They should already be in os.environ, but belt-and-suspenders approach)
+                critical_vars = ['CUDA_VISIBLE_DEVICES', 'HF_TOKEN', 'RUN_SLOW',
+                               'NCCL_DEBUG', 'ROCR_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES',
+                               'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
+                               'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE']
+                for var in critical_vars:
+                    if var in os.environ:
+                        env[var] = os.environ[var]
 
                 result = subprocess.run(
                     [sys.executable, script_path],
@@ -150,9 +156,11 @@ sys.exit(exit_code)
                     if test_outcome == 'skipped':
                         # Test was skipped - preserve the skip!
                         skip_reason = self._get_skip_reason(junit_path, item.nodeid)
+                        # Use proper format for skip: (file, lineno, reason)
+                        skip_location = (str(item.fspath), item.location[1], skip_reason or "Skipped")
                         return self._make_report(
                             item, "call", "skipped",
-                            longrepr=(None, None, skip_reason or "Skipped"),
+                            longrepr=skip_location,
                             duration=duration
                         )
                     elif test_outcome == 'passed':
