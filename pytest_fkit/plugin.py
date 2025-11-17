@@ -90,43 +90,15 @@ class CrashIsolationPlugin:
         junit_fd, junit_path = tempfile.mkstemp(suffix='.xml', prefix='fkit_')
         os.close(junit_fd)
 
-        # Create a script that will run just this test
-        # The -p no:fkit flag ensures fkit doesn't run recursively
-        test_script = f"""
-import sys
-import pytest
-
-# Run the test without fkit plugin and capture results in JUnit XML
-# Environment variables are inherited from parent process
-exit_code = pytest.main([
-    '{item.nodeid}',
-    '-v',
-    '--tb=short',
-    '--continue-on-collection-errors',
-    '-p', 'no:cacheprovider',
-    '-p', 'no:fkit',  # Explicitly disable fkit to prevent recursion
-    '--junitxml={junit_path}',  # Capture actual test results
-])
-
-sys.exit(exit_code)
-"""
-
-        # Write script to temp file
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as f:
-            f.write(test_script)
-            script_path = f.name
-
         try:
             # Run subprocess
             start_time = time.time()
 
             try:
                 # Prepare environment - inherit ALL environment variables
-                # No need to set PYTEST_DISABLE_PLUGIN_AUTOLOAD since we use -p no:fkit in command
                 env = os.environ.copy()
 
                 # Explicitly ensure critical variables are set if they exist
-                # (They should already be in os.environ, but belt-and-suspenders approach)
                 critical_vars = ['CUDA_VISIBLE_DEVICES', 'HF_TOKEN', 'RUN_SLOW',
                                'NCCL_DEBUG', 'ROCR_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES',
                                'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
@@ -135,8 +107,21 @@ sys.exit(exit_code)
                     if var in os.environ:
                         env[var] = os.environ[var]
 
+                # Run pytest DIRECTLY as subprocess command (not via pytest.main())
+                # This avoids TestReport formatting issues and ensures clean subprocess execution
+                pytest_cmd = [
+                    sys.executable, '-m', 'pytest',
+                    item.nodeid,
+                    '-v',
+                    '--tb=short',
+                    '--continue-on-collection-errors',
+                    '-p', 'no:cacheprovider',
+                    '-p', 'no:fkit',  # Disable fkit to prevent recursion
+                    f'--junitxml={junit_path}',  # Capture actual test results
+                ]
+
                 result = subprocess.run(
-                    [sys.executable, script_path],
+                    pytest_cmd,
                     capture_output=True,
                     text=True,
                     timeout=self.timeout,
@@ -240,11 +225,7 @@ sys.exit(exit_code)
                 )
 
         finally:
-            # Clean up temp files
-            try:
-                os.unlink(script_path)
-            except:
-                pass
+            # Clean up temp JUnit XML file
             try:
                 os.unlink(junit_path)
             except:
