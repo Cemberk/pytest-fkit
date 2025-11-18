@@ -65,16 +65,24 @@ class CrashIsolationPlugin:
             return None
 
         # We'll handle this test ourselves
-        # Setup phase
+        # Setup phase - log start
         item.ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
+
+        # Generate and send setup report (always pass)
+        setup_report = self._make_report(item, "setup", "passed", duration=0)
+        item.ihook.pytest_runtest_logreport(report=setup_report)
 
         # Call phase - run in subprocess for isolation
         call_report = self._run_test_in_subprocess(item)
 
-        # Send report
+        # Send call report
         item.ihook.pytest_runtest_logreport(report=call_report)
 
-        # Teardown phase
+        # Generate and send teardown report (always pass)
+        teardown_report = self._make_report(item, "teardown", "passed", duration=0)
+        item.ihook.pytest_runtest_logreport(report=teardown_report)
+
+        # Teardown phase - log finish
         item.ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
 
         # Return True to tell pytest we handled this test completely
@@ -290,10 +298,10 @@ class CrashIsolationPlugin:
             return "Skipped"
 
     def _make_report(self, item, when, outcome, longrepr=None, duration=0, crash=False, timeout=False):
-        """Create a test report."""
+        """Create a test report compatible with pytest's reporting system."""
         from _pytest.reports import TestReport
 
-        # Create report
+        # Create report with all required attributes for proper pytest integration
         report = TestReport(
             nodeid=item.nodeid,
             location=item.location,
@@ -302,9 +310,13 @@ class CrashIsolationPlugin:
             longrepr=longrepr,
             when=when,
             duration=duration,
+            # sections is required for some pytest plugins
+            sections=[],
+            # user_properties is required for proper reporting
+            user_properties=[],
         )
 
-        # Add custom attributes
+        # Add custom attributes for crash/timeout indication
         if crash:
             report.crash = True
         if timeout:
