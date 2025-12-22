@@ -37,6 +37,11 @@ from .dataflow import (
     compute_value_hash,
 )
 
+# Lazy import for perspectives to avoid circular imports
+def _get_perspective_registry():
+    from .perspectives import PerspectiveRegistry, FrameworkExpert, RefactorExpert
+    return PerspectiveRegistry, FrameworkExpert, RefactorExpert
+
 
 class BottleneckSource(Enum):
     """Source layer of a bottleneck."""
@@ -215,9 +220,12 @@ class CorrelationEngine:
         # Get analysis
         profile = engine.stop()
         bottlenecks = profile.bottlenecks
+
+        # Get perspective insights
+        insights = engine.get_perspective_insights()
     """
 
-    def __init__(self):
+    def __init__(self, enable_perspectives: bool = True):
         self.stack_tracer: Optional[StackTracer] = None
         self.dataflow_tracker: Optional[DataflowTracker] = None
 
@@ -234,6 +242,40 @@ class CorrelationEngine:
 
         # Graph compilation cache
         self._compilation_info: Dict[str, Any] = {}
+
+        # Expert perspectives
+        self._perspective_registry = None
+        self._enable_perspectives = enable_perspectives
+        if enable_perspectives:
+            self._init_perspectives()
+
+    def _init_perspectives(self) -> None:
+        """Initialize default expert perspectives."""
+        try:
+            PerspectiveRegistry, FrameworkExpert, RefactorExpert = _get_perspective_registry()
+            self._perspective_registry = PerspectiveRegistry()
+            self._perspective_registry.register(FrameworkExpert())
+            self._perspective_registry.register(RefactorExpert())
+        except ImportError:
+            self._perspective_registry = None
+
+    def add_perspective(self, perspective) -> None:
+        """Add a custom expert perspective."""
+        if self._perspective_registry is None:
+            PerspectiveRegistry, _, _ = _get_perspective_registry()
+            self._perspective_registry = PerspectiveRegistry()
+        self._perspective_registry.register(perspective)
+
+    def remove_perspective(self, name: str) -> None:
+        """Remove a perspective by name."""
+        if self._perspective_registry:
+            self._perspective_registry.unregister(name)
+
+    def list_perspectives(self) -> List[str]:
+        """List registered perspective names."""
+        if self._perspective_registry:
+            return self._perspective_registry.list_perspectives()
+        return []
 
     def add_stack_tracer(self, tracer: StackTracer) -> None:
         """Add stack tracer for stack dimension."""
@@ -571,6 +613,84 @@ class CorrelationEngine:
             self.start_time = None
             self.end_time = None
 
+    # ============== Perspective Analysis Methods ==============
+
+    def get_perspective_context(self) -> Dict[str, Any]:
+        """Get context dict for perspective analysis."""
+        return {
+            "stack_tracer": self.stack_tracer,
+            "dataflow_tracker": self.dataflow_tracker,
+            "gpu_metrics": self._gpu_metrics,
+            "compilation_info": self._compilation_info,
+        }
+
+    def get_perspective_insights(self) -> Dict[str, List[Any]]:
+        """
+        Get insights from all registered perspectives.
+
+        Returns:
+            Dict mapping perspective name to list of PerspectiveInsight
+        """
+        if not self._perspective_registry:
+            return {}
+
+        context = self.get_perspective_context()
+        return self._perspective_registry.analyze_all(self.correlation_points, context)
+
+    def get_all_blame_targets(self) -> List[Any]:
+        """
+        Get blame targets from all perspectives.
+
+        Returns:
+            List of BlameTarget from all perspectives
+        """
+        if not self._perspective_registry:
+            return []
+
+        context = self.get_perspective_context()
+        return self._perspective_registry.get_all_blame_targets(self.correlation_points, context)
+
+    def get_framework_report(self) -> Dict[str, Any]:
+        """
+        Get framework-specific analysis report.
+
+        Returns detailed breakdown of which frameworks are consuming time.
+        """
+        if not self._perspective_registry:
+            return {}
+
+        framework_expert = self._perspective_registry.get("framework_expert")
+        if framework_expert and hasattr(framework_expert, "get_framework_report"):
+            context = self.get_perspective_context()
+            return framework_expert.get_framework_report(self.correlation_points, context)
+        return {}
+
+    def get_hotspot_report(self, top_n: int = 20) -> Dict[str, Any]:
+        """
+        Get code hotspot analysis report.
+
+        Returns specific file:line locations consuming the most time,
+        with git blame information when available.
+        """
+        if not self._perspective_registry:
+            return {}
+
+        refactor_expert = self._perspective_registry.get("refactor_expert")
+        if refactor_expert and hasattr(refactor_expert, "get_hotspot_report"):
+            context = self.get_perspective_context()
+            return refactor_expert.get_hotspot_report(self.correlation_points, context, top_n)
+        return {}
+
+    def get_perspective_summary(self) -> Dict[str, Any]:
+        """Get combined summary from all perspectives."""
+        if not self._perspective_registry:
+            return {"perspectives_enabled": False}
+
+        context = self.get_perspective_context()
+        summary = self._perspective_registry.get_summary(self.correlation_points, context)
+        summary["perspectives_enabled"] = True
+        return summary
+
 
 class UnifiedTracer:
     """
@@ -693,3 +813,33 @@ class UnifiedTracer:
         if self.dataflow_tracker:
             self.dataflow_tracker.clear()
         self.correlation_engine.clear()
+
+    # ============== Perspective Analysis Methods ==============
+
+    def get_perspective_insights(self) -> Dict[str, List[Any]]:
+        """Get insights from all registered perspectives."""
+        return self.correlation_engine.get_perspective_insights()
+
+    def get_all_blame_targets(self) -> List[Any]:
+        """Get blame targets from all perspectives."""
+        return self.correlation_engine.get_all_blame_targets()
+
+    def get_framework_report(self) -> Dict[str, Any]:
+        """Get framework-specific analysis report."""
+        return self.correlation_engine.get_framework_report()
+
+    def get_hotspot_report(self, top_n: int = 20) -> Dict[str, Any]:
+        """Get code hotspot analysis report with git blame."""
+        return self.correlation_engine.get_hotspot_report(top_n)
+
+    def get_perspective_summary(self) -> Dict[str, Any]:
+        """Get combined summary from all perspectives."""
+        return self.correlation_engine.get_perspective_summary()
+
+    def add_perspective(self, perspective) -> None:
+        """Add a custom expert perspective."""
+        self.correlation_engine.add_perspective(perspective)
+
+    def list_perspectives(self) -> List[str]:
+        """List registered perspective names."""
+        return self.correlation_engine.list_perspectives()

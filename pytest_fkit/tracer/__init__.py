@@ -195,6 +195,23 @@ from .correlation import (
     UnifiedTracer,
 )
 
+# Expert perspectives
+from .perspectives import (
+    ExpertPerspective,
+    PerspectiveInsight,
+    PerspectiveRegistry,
+    BlameTarget,
+    SeverityLevel,
+    FrameworkExpert,
+    FrameworkInfo,
+    FrameworkBlame,
+    FRAMEWORK_PATTERNS,
+    RefactorExpert,
+    CodeLocation,
+    CommitBlame,
+    RefactorSuggestion,
+)
+
 __all__ = [
     # Core tracing
     "Tracer",
@@ -288,6 +305,20 @@ __all__ = [
     "ExecutionProfile",
     "CorrelationEngine",
     "UnifiedTracer",
+    # Expert perspectives
+    "ExpertPerspective",
+    "PerspectiveInsight",
+    "PerspectiveRegistry",
+    "BlameTarget",
+    "SeverityLevel",
+    "FrameworkExpert",
+    "FrameworkInfo",
+    "FrameworkBlame",
+    "FRAMEWORK_PATTERNS",
+    "RefactorExpert",
+    "CodeLocation",
+    "CommitBlame",
+    "RefactorSuggestion",
 ]
 
 __version__ = "0.2.0"
