@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .collector import TraceCollector
-from .exporter import export_for_pysr, export_to_csv, export_to_json
+from .exporter import export_for_pysr, export_to_csv, export_to_csv_with_formulas, export_to_json
 
 
 def run_command(
@@ -106,10 +106,18 @@ def cmd_run(args: argparse.Namespace) -> int:
             if args.stop_on_error:
                 break
 
-    # Export results
+    # Export results with automatic PySR formula discovery
     if args.output:
-        export_to_csv(collector.rows, args.output)
-        print(f"\nTraces exported to: {args.output}")
+        csv_path, formulas = export_to_csv_with_formulas(
+            collector.rows,
+            args.output,
+        )
+        print(f"\nTraces exported to: {csv_path}")
+
+        if formulas:
+            print(f"PySR discovered {len(formulas)} formula(s):")
+            for target, result in formulas.items():
+                print(f"  {target}: {result.equation} (R²={result.r2_score:.3f})")
 
     if args.pysr:
         export_for_pysr(collector.rows, args.pysr)
@@ -188,43 +196,41 @@ def cmd_analyze(args: argparse.Namespace) -> int:
 
     # Formula discovery with PySR
     if args.formula:
-        try:
-            from pysr import PySRRegressor
-        except ImportError:
-            print("\nPySR not installed. Install with: pip install pysr")
+        from .pysr_runner import PySRRunner, export_formulas_summary
+
+        runner = PySRRunner(
+            min_samples=10,
+            niterations=args.iterations or 40,
+        )
+
+        if not runner.is_available():
+            print("\nPySR not installed. Install with: pip install pytest-fkit[pysr]")
             return 1
 
         print("\nRunning symbolic regression with PySR...")
 
-        # Prepare data
-        from .exporter import PySRDataPreparer
-
-        preparer = PySRDataPreparer(target=args.target or "duration_ms")
-        for row in rows:
-            preparer.add(row)
-
-        if len(preparer) < 10:
-            print("Not enough data points for regression (need at least 10)")
-            return 1
+        # Determine target
+        targets = [args.target] if args.target else None
 
         try:
-            X, y = preparer.get_arrays()
-            feature_names = preparer.get_feature_names()
+            formulas = runner.discover_formulas(rows, targets=targets)
 
-            model = PySRRegressor(
-                niterations=args.iterations or 40,
-                binary_operators=["+", "-", "*", "/"],
-                unary_operators=["log", "exp", "sqrt"],
-                populations=8,
-                population_size=33,
-            )
-            model.fit(X, y, variable_names=feature_names)
+            if not formulas:
+                print("No formulas discovered (not enough data or no valid targets)")
+                return 1
 
             print("\nDiscovered formulas:")
-            print(model)
+            for target, result in formulas.items():
+                print(f"\n  Target: {target}")
+                print(f"    Equation: {result.equation}")
+                print(f"    R² Score: {result.r2_score:.4f}")
+                print(f"    MSE: {result.mse:.4f}")
+                print(f"    Complexity: {result.complexity}")
+                print(f"    Features: {', '.join(result.feature_names)}")
+                print(f"    Samples: {result.n_samples}")
 
             if args.formula_output:
-                model.equations_.to_csv(args.formula_output)
+                export_formulas_summary(formulas, args.formula_output)
                 print(f"\nFormulas saved to: {args.formula_output}")
 
         except Exception as e:

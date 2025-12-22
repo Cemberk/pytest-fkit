@@ -103,7 +103,15 @@ from .exporter import (
     PySRDataPreparer,
     export_for_pysr,
     export_to_csv,
+    export_to_csv_with_formulas,
     export_to_json,
+)
+
+# PySR symbolic regression
+from .pysr_runner import (
+    FormulaResult,
+    PySRRunner,
+    export_formulas_summary,
 )
 
 # Hardware profiling
@@ -211,7 +219,12 @@ __all__ = [
     "PySRDataPreparer",
     "export_for_pysr",
     "export_to_csv",
+    "export_to_csv_with_formulas",
     "export_to_json",
+    # PySR symbolic regression
+    "FormulaResult",
+    "PySRRunner",
+    "export_formulas_summary",
     # Hardware profiling
     "GPUInfo",
     "HardwareProfiler",

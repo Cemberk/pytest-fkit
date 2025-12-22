@@ -25,7 +25,7 @@ from _pytest.nodes import Item
 from _pytest.reports import TestReport
 
 from .collector import TraceCollector, TraceRow
-from .exporter import export_for_pysr, export_to_csv, export_to_json
+from .exporter import export_for_pysr, export_to_csv, export_to_csv_with_formulas, export_to_json
 
 
 class TracerPlugin:
@@ -149,10 +149,18 @@ class TracerPlugin:
 
     def pytest_sessionfinish(self, session, exitstatus) -> None:
         """Called after all tests complete."""
-        # Export results
+        # Export results with automatic PySR formula discovery
         if self.output_path:
-            export_to_csv(self.collector.rows, self.output_path)
-            print(f"\nTrace data exported to: {self.output_path}")
+            csv_path, formulas = export_to_csv_with_formulas(
+                self.collector.rows,
+                self.output_path,
+            )
+            print(f"\nTrace data exported to: {csv_path}")
+
+            if formulas:
+                print(f"PySR discovered {len(formulas)} formula(s):")
+                for target, result in formulas.items():
+                    print(f"  {target}: {result.equation} (R²={result.r2_score:.3f})")
 
         if self.pysr_path:
             export_for_pysr(

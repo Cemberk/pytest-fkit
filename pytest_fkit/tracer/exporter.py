@@ -378,3 +378,64 @@ class PySRDataPreparer:
 
     def __len__(self) -> int:
         return len(self._data)
+
+
+def export_to_csv_with_formulas(
+    rows: List[Union[TraceRow, Dict[str, Any]]],
+    output_path: str,
+    pysr_targets: Optional[List[str]] = None,
+    pysr_min_samples: int = 20,
+    formulas_output_path: Optional[str] = None,
+) -> tuple:
+    """
+    Export traces to CSV with automatic PySR formula discovery.
+
+    If PySR is available and there are enough samples, runs symbolic
+    regression and adds predictions as new columns.
+
+    Args:
+        rows: Trace rows to export
+        output_path: Output CSV path
+        pysr_targets: Target metrics for PySR (auto-detect if None)
+        pysr_min_samples: Minimum samples required for PySR
+        formulas_output_path: Optional path for formulas JSON (default: {output_path}_formulas.json)
+
+    Returns:
+        Tuple of (csv_path, formulas_dict or None)
+    """
+    from .pysr_runner import PySRRunner, export_formulas_summary
+
+    formulas = None
+    rows_to_export = rows
+
+    try:
+        runner = PySRRunner(min_samples=pysr_min_samples)
+
+        if runner.is_available() and len(rows) >= pysr_min_samples:
+            # Discover formulas
+            formulas = runner.discover_formulas(rows, targets=pysr_targets)
+
+            if formulas:
+                # Add predictions to rows
+                rows_to_export = runner.add_predictions_to_rows(rows, formulas)
+
+                # Export formulas summary
+                if formulas_output_path is None:
+                    # Default to same path with _formulas.json suffix
+                    base = output_path.rsplit(".", 1)[0]
+                    formulas_output_path = f"{base}_formulas.json"
+
+                export_formulas_summary(formulas, formulas_output_path)
+
+    except ImportError:
+        # PySR not installed, continue with normal export
+        pass
+    except Exception as e:
+        # Log error but don't fail the export
+        import logging
+        logging.getLogger(__name__).warning(f"PySR analysis failed: {e}")
+
+    # Export CSV
+    csv_path = export_to_csv(rows_to_export, output_path)
+
+    return csv_path, formulas
