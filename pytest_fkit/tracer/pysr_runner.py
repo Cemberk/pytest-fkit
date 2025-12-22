@@ -184,7 +184,7 @@ class PySRRunner:
         self, target: str, columns: List[str], exclude_prefixes: Optional[List[str]] = None
     ) -> List[str]:
         """Get feature columns for a target, excluding the target itself."""
-        exclude_prefixes = exclude_prefixes or ["tag_", "pysr_"]
+        exclude_prefixes = exclude_prefixes or ["tag_", "calc_"]
 
         features = []
         for col in columns:
@@ -374,14 +374,14 @@ class PySRRunner:
         formulas: Dict[str, FormulaResult],
     ) -> List[Dict[str, Any]]:
         """
-        Add PySR predictions and formula metadata to trace rows.
+        Add predictions and formula metadata to trace rows.
 
         Args:
             rows: Original trace rows
             formulas: Discovered formulas from discover_formulas()
 
         Returns:
-            List of dictionaries with added pysr_* columns
+            List of dictionaries with added calc_* columns
         """
         if not formulas:
             # No formulas, just convert rows to dicts
@@ -404,9 +404,9 @@ class PySRRunner:
 
                 # Add formula metadata only
                 for target, formula in formulas.items():
-                    row_dict[f"pysr_formula_{target}"] = formula.equation
-                    row_dict[f"pysr_r2_{target}"] = formula.r2_score
-                    row_dict[f"pysr_complexity_{target}"] = formula.complexity
+                    row_dict[f"calc_formula_{target}"] = formula.equation
+                    row_dict[f"calc_r2_{target}"] = formula.r2_score
+                    row_dict[f"calc_complexity_{target}"] = formula.complexity
 
                 result.append(row_dict)
             return result
@@ -427,9 +427,9 @@ class PySRRunner:
 
             for target, formula in formulas.items():
                 # Add formula metadata
-                row_dict[f"pysr_formula_{target}"] = formula.equation
-                row_dict[f"pysr_r2_{target}"] = formula.r2_score
-                row_dict[f"pysr_complexity_{target}"] = formula.complexity
+                row_dict[f"calc_formula_{target}"] = formula.equation
+                row_dict[f"calc_r2_{target}"] = formula.r2_score
+                row_dict[f"calc_complexity_{target}"] = formula.complexity
 
                 # Compute prediction if model available
                 if formula._model is not None and formula.feature_names:
@@ -441,12 +441,12 @@ class PySRRunner:
                         X = np.array([feature_vals], dtype=np.float64)
                         prediction = formula._model.predict(X)[0]
 
-                        row_dict[f"pysr_predicted_{target}"] = float(prediction)
+                        row_dict[f"calc_predicted_{target}"] = float(prediction)
 
                         # Compute residual if actual value exists
                         actual = numeric_row.get(target)
                         if actual is not None:
-                            row_dict[f"pysr_residual_{target}"] = float(actual - prediction)
+                            row_dict[f"calc_residual_{target}"] = float(actual - prediction)
 
                     except Exception as e:
                         logger.debug(f"Could not compute prediction for {target}: {e}")
