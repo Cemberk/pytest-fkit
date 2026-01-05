@@ -1,9 +1,13 @@
 Metadata-Version: 2.4
 Name: pytest-fkit
 Version: 0.1.0
-Summary: A pytest plugin that prevents crashes from killing your test suite
-Author: AISE Team
+Summary: A pytest plugin that prevents crashes from killing your test suite, with execution tracing
+Author: Cemberk
 License: MIT
+Project-URL: Homepage, https://github.com/Cemberk/pytest-fkit
+Project-URL: Repository, https://github.com/Cemberk/pytest-fkit
+Project-URL: Issues, https://github.com/Cemberk/pytest-fkit/issues
+Keywords: pytest,testing,crash,isolation,subprocess,tracing
 Classifier: Framework :: Pytest
 Classifier: Programming Language :: Python :: 3
 Classifier: Programming Language :: Python :: 3.8
@@ -15,7 +19,20 @@ Classifier: License :: OSI Approved :: MIT License
 Classifier: Operating System :: OS Independent
 Requires-Python: >=3.8
 Description-Content-Type: text/markdown
+License-File: LICENSE
 Requires-Dist: pytest>=6.0.0
+Provides-Extra: tracer
+Requires-Dist: psutil>=5.0.0; extra == "tracer"
+Provides-Extra: pysr
+Requires-Dist: pysr>=0.16.0; extra == "pysr"
+Requires-Dist: numpy>=1.20.0; extra == "pysr"
+Requires-Dist: pandas>=1.3.0; extra == "pysr"
+Provides-Extra: all
+Requires-Dist: psutil>=5.0.0; extra == "all"
+Requires-Dist: pysr>=0.16.0; extra == "all"
+Requires-Dist: numpy>=1.20.0; extra == "all"
+Requires-Dist: pandas>=1.3.0; extra == "all"
+Dynamic: license-file
 Dynamic: requires-python
 
 # pytest-fkit

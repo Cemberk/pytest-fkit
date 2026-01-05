@@ -1,2 +1,6 @@
+[console_scripts]
+fkit-tracer = pytest_fkit.tracer.cli:main
+
 [pytest11]
 fkit = pytest_fkit.plugin
+fkit_tracer = pytest_fkit.tracer.pytest_plugin
