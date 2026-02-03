@@ -41,6 +41,8 @@ Dynamic: requires-python
 
 When a test crashes Python (SIGABRT, SIGSEGV, etc.), it catches the crash and converts it to a normal pytest ERROR instead of killing your entire test run.
 
+**Now with parallel workers and GPU affinity!**
+
 ## The Problem
 
 When running large test suites (like HuggingFace Transformers), sometimes a test causes Python to crash with a signal like SIGABRT:
@@ -91,9 +93,45 @@ Set a timeout per test (default is 600 seconds / 10 minutes):
 pytest --fkit --fkit-timeout=300  # 5 minute timeout per test
 ```
 
+### Parallel Workers (NEW!)
+
+Run tests in parallel across multiple workers with automatic GPU affinity:
+
 ```bash
-# In transformers_ut.sh
-pytest --fkit --fkit-timeout=600 tests/
+# Auto-detect workers based on GPU count
+pytest --fkit --fkit-workers=auto
+
+# Specific number of workers
+pytest --fkit --fkit-workers=4
+
+# Control GPUs per worker (for multi-GPU tests)
+pytest --fkit --fkit-workers=4 --fkit-gpus-per-worker=2
+```
+
+### GPU Allocation Examples
+
+**8 GPUs with multi-GPU tests (need 2 GPUs each):**
+```bash
+pytest --fkit --fkit-workers=4 --fkit-gpus-per-worker=2
+# Worker 0: GPU 0,1
+# Worker 1: GPU 2,3
+# Worker 2: GPU 4,5
+# Worker 3: GPU 6,7
+```
+
+**8 GPUs with single-GPU tests:**
+```bash
+pytest --fkit --fkit-workers=8 --fkit-gpus-per-worker=1
+# Worker 0: GPU 0
+# Worker 1: GPU 1
+# ...
+# Worker 7: GPU 7
+```
+
+**Auto-detection:**
+```bash
+pytest --fkit --fkit-workers=auto --fkit-gpus-per-worker=2
+# Automatically detects GPUs and calculates optimal worker count
 ```
 
 ### Skip Crash Isolation for Specific Tests
@@ -109,21 +147,60 @@ def test_something_special():
     pass
 ```
 
+### Mark GPU Requirements
+
+Mark tests for optimal GPU scheduling:
+
+```python
+import pytest
+
+@pytest.mark.fkit_multi_gpu
+def test_distributed_training():
+    # This test needs multiple GPUs
+    pass
+
+@pytest.mark.fkit_single_gpu
+def test_simple_forward():
+    # This test needs only one GPU
+    pass
+```
+
 ## How It Works
 
-1. **Subprocess Isolation**: Each test runs in its own Python subprocess
-2. **Signal Detection**: When a subprocess is killed by a signal (negative return code), we detect it
-3. **Error Conversion**: Crashes are converted to pytest ERROR results with full output
-4. **Continuation**: The main pytest process continues with remaining tests
+1. **GPU Detection**: Automatically detects AMD (ROCm) or NVIDIA GPUs
+2. **Worker Pool**: Creates N parallel workers, each with dedicated GPUs
+3. **GPU Affinity**: Sets `CUDA_VISIBLE_DEVICES` / `HIP_VISIBLE_DEVICES` for each worker
+4. **Subprocess Isolation**: Each test runs in its own subprocess within a worker
+5. **Signal Detection**: Crashes (negative return codes) are caught and converted to ERROR
+6. **Continuation**: Other workers continue running their tests
+
+### Architecture
+
+```
+pytest main process
+    ├── Worker 0 (GPU 0,1) ─── test1, test5, test9...
+    ├── Worker 1 (GPU 2,3) ─── test2, test6, test10...
+    ├── Worker 2 (GPU 4,5) ─── test3, test7, test11...
+    └── Worker 3 (GPU 6,7) ─── test4, test8, test12...
+```
+
+Each worker runs tests sequentially in subprocesses for crash isolation,
+but workers execute in parallel for throughput.
 
 ## Example Output
 
 ```
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_forward PASSED
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b_a2b_generation 💥
+🚀 pytest-fkit: 4 workers, 8 AMD GPUs, 2 GPU(s)/worker
+   GPU allocations: ['0,1', '2,3', '4,5', '6,7']
+
+🔄 Running 1000 tests across 4 workers...
+
+tests/models/bert/test_modeling_bert.py::BertModelTest::test_forward PASSED
+tests/models/llama/test_modeling_llama.py::LlamaModelTest::test_forward PASSED
+tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b 💥
 
 ======================================================================
-💥 TEST CRASHED: SIGABRT (Aborted)
+💥 TEST CRASHED: SIGABRT (Aborted) (Worker 2, GPUs: 4,5)
 ======================================================================
 
 This test caused Python to crash with SIGABRT (Aborted).
@@ -137,37 +214,67 @@ Fatal Python error: Aborted
 ...crash traceback...
 ======================================================================
 
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_backward PASSED
+tests/models/whisper/test_modeling_whisper.py::WhisperModelTest::test_forward PASSED
+
+✅ Completed 1000 tests (1 crashes, 0 timeouts)
 
 =============== pytest-fkit summary ===============
 💥 1 test(s) CRASHED (converted to ERROR by pytest-fkit):
-  - tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b_a2b_generation
+  - tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b
 
 ✅ pytest-fkit prevented 1 crashes from killing your test suite!
 ```
 
+## Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--fkit` | `False` | Enable crash isolation |
+| `--fkit-timeout` | `600` | Timeout per test in seconds |
+| `--fkit-workers` | `1` | Number of parallel workers (`auto` for GPU-based) |
+| `--fkit-gpus-per-worker` | `2` | GPUs assigned to each worker |
+
+## Environment Variables Set Per Worker
+
+| Variable | Description |
+|----------|-------------|
+| `CUDA_VISIBLE_DEVICES` | GPU IDs for NVIDIA / compatibility |
+| `HIP_VISIBLE_DEVICES` | GPU IDs for AMD ROCm |
+| `ROCR_VISIBLE_DEVICES` | GPU IDs for AMD ROCm runtime |
+| `FKIT_WORKER_ID` | Worker index (0, 1, 2, ...) |
+| `FKIT_GPU_IDS` | Assigned GPU IDs string |
+
 ## Performance Considerations
 
-- **Overhead**: Running each test in a subprocess adds overhead (~100-500ms per test)
-- **Best For**: Large test suites where crashes are occasional but catastrophic
-- **Not Recommended**: Tiny test suites with < 100 tests where crashes are rare
+- **Overhead**: ~100-500ms per test for subprocess spawning
+- **Parallelism**: N workers = ~N× throughput (minus overhead)
+- **GPU Memory**: Each worker has dedicated GPUs - no memory contention
+- **Best For**: Large test suites on multi-GPU systems
+- **Trade-off**: More workers = more parallelism but less GPUs per worker
 
-For the HuggingFace Transformers test suite with 100,000+ tests, the overhead is worth it to ensure all tests run to completion.
+### Recommended Configurations
 
-## Configuration
+| Scenario | Workers | GPUs/Worker | Command |
+|----------|---------|-------------|---------|
+| 8 GPUs, multi-GPU tests | 4 | 2 | `--fkit-workers=4 --fkit-gpus-per-worker=2` |
+| 8 GPUs, single-GPU tests | 8 | 1 | `--fkit-workers=8 --fkit-gpus-per-worker=1` |
+| 4 GPUs, mixed tests | 2 | 2 | `--fkit-workers=2 --fkit-gpus-per-worker=2` |
+| No GPUs (CPU tests) | auto | - | `--fkit-workers=auto` |
 
-You can also enable pytest-fkit in `pytest.ini` or `pyproject.toml`:
+## Configuration File
+
+Enable pytest-fkit in `pytest.ini` or `pyproject.toml`:
 
 ```ini
 # pytest.ini
 [pytest]
-addopts = --fkit --fkit-timeout=600
+addopts = --fkit --fkit-timeout=600 --fkit-workers=auto
 ```
 
 ```toml
 # pyproject.toml
 [tool.pytest.ini_options]
-addopts = ["--fkit", "--fkit-timeout=600"]
+addopts = ["--fkit", "--fkit-timeout=600", "--fkit-workers=auto"]
 ```
 
 ## Compatibility
@@ -175,6 +282,28 @@ addopts = ["--fkit", "--fkit-timeout=600"]
 - Python 3.8+
 - pytest 6.0+
 - Linux, macOS (Windows support TBD)
+- AMD ROCm GPUs (detected via `rocm-smi`)
+- NVIDIA GPUs (detected via `nvidia-smi`)
+
+## Comparison with pytest-xdist
+
+| Feature | pytest-fkit | pytest-xdist |
+|---------|-------------|--------------|
+| Crash isolation | ✅ Yes | ❌ No |
+| GPU affinity | ✅ Yes | ❌ Manual |
+| Parallel execution | ✅ Yes | ✅ Yes |
+| Memory isolation | ✅ Per-test | ⚠️ Per-worker |
+| Overhead | Higher | Lower |
+
+**Use pytest-fkit when:**
+- Tests can crash Python (GPU drivers, C extensions)
+- You need automatic GPU affinity
+- You need per-test isolation
+
+**Use pytest-xdist when:**
+- Tests are stable (no crashes)
+- You need minimal overhead
+- Tests don't use GPUs
 
 ## License
 

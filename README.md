@@ -4,6 +4,12 @@
 
 When a test crashes Python (SIGABRT, SIGSEGV, etc.), it catches the crash and converts it to a normal pytest ERROR instead of killing your entire test run.
 
+**Features:**
+- Parallel workers with GPU affinity
+- Dynamic work queue scheduling (tests go to first available worker)
+- Automatic GPU error detection and retry on different workers
+- Fault tolerance (workers can fail without stopping the test run)
+
 ## The Problem
 
 When running large test suites (like HuggingFace Transformers), sometimes a test causes Python to crash with a signal like SIGABRT:
@@ -54,9 +60,69 @@ Set a timeout per test (default is 600 seconds / 10 minutes):
 pytest --fkit --fkit-timeout=300  # 5 minute timeout per test
 ```
 
+### Parallel Workers with Dynamic Scheduling
+
+Run tests in parallel with automatic work distribution:
+
 ```bash
-# In transformers_ut.sh
-pytest --fkit --fkit-timeout=600 tests/
+# Auto-detect workers based on GPU count
+pytest --fkit --fkit-workers=auto
+
+# Specific number of workers
+pytest --fkit --fkit-workers=4
+
+# Control GPUs per worker (for multi-GPU tests)
+pytest --fkit --fkit-workers=4 --fkit-gpus-per-worker=2
+```
+
+**Dynamic Scheduling**: Tests are NOT pre-assigned to workers. Instead:
+1. All tests go into a shared work queue
+2. Workers pull tests as they become available
+3. First available worker gets the next test
+4. Automatic load balancing across workers
+
+### GPU Allocation Examples
+
+**8 GPUs with multi-GPU tests (need 2 GPUs each):**
+```bash
+pytest --fkit --fkit-workers=4 --fkit-gpus-per-worker=2
+# Worker 0: GPU 0,1
+# Worker 1: GPU 2,3
+# Worker 2: GPU 4,5
+# Worker 3: GPU 6,7
+```
+
+**8 GPUs with single-GPU tests:**
+```bash
+pytest --fkit --fkit-workers=8 --fkit-gpus-per-worker=1
+# Worker 0: GPU 0
+# Worker 1: GPU 1
+# ...
+# Worker 7: GPU 7
+```
+
+### Fault Tolerance
+
+pytest-fkit handles GPU failures gracefully:
+
+1. **GPU Error Detection**: Automatically detects GPU-related errors (CUDA OOM, HIP errors, etc.)
+
+2. **Automatic Retry**: If a test fails due to GPU errors, it's automatically retried on a different worker
+
+3. **Worker Disabling**: If a worker encounters 3+ consecutive GPU errors, it's disabled and remaining tests are scheduled to healthy workers
+
+4. **No Test Loss**: Even if GPUs are missing or workers fail, all tests will eventually run on available workers
+
+**Example scenario:**
+```
+Worker 0 (GPU 0,1): Running tests...
+Worker 1 (GPU 2,3): Running tests...
+Worker 2 (GPU 4,5): ⚠️ GPU 4 missing - CUDA error
+                   → Test retried on Worker 0
+Worker 3 (GPU 6,7): Running tests...
+
+# Worker 2 disabled after 3 GPU errors
+# Remaining tests automatically go to Workers 0, 1, 3
 ```
 
 ### Skip Crash Isolation for Specific Tests
@@ -72,72 +138,191 @@ def test_something_special():
     pass
 ```
 
+### Mark GPU Requirements
+
+Mark tests for documentation (future: optimal GPU scheduling):
+
+```python
+import pytest
+
+@pytest.mark.fkit_multi_gpu
+def test_distributed_training():
+    # This test needs multiple GPUs
+    pass
+
+@pytest.mark.fkit_single_gpu
+def test_simple_forward():
+    # This test needs only one GPU
+    pass
+```
+
 ## How It Works
 
-1. **Subprocess Isolation**: Each test runs in its own Python subprocess
-2. **Signal Detection**: When a subprocess is killed by a signal (negative return code), we detect it
-3. **Error Conversion**: Crashes are converted to pytest ERROR results with full output
-4. **Continuation**: The main pytest process continues with remaining tests
+### Architecture
+
+```
+                    ┌─────────────────────────────────────┐
+                    │          Shared Work Queue          │
+                    │  [test1, test2, test3, test4, ...]  │
+                    └──────────────┬──────────────────────┘
+                                   │
+            ┌──────────────────────┼──────────────────────┐
+            │                      │                      │
+            ▼                      ▼                      ▼
+    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+    │   Worker 0    │      │   Worker 1    │      │   Worker 2    │
+    │  GPU 0,1      │      │  GPU 2,3      │      │  GPU 4,5      │
+    │               │      │               │      │               │
+    │  Pull next    │      │  Pull next    │      │  Pull next    │
+    │  available    │      │  available    │      │  available    │
+    │  test         │      │  test         │      │  test         │
+    └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
+            │                      │                      │
+            ▼                      ▼                      ▼
+    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
+    │  Subprocess   │      │  Subprocess   │      │  Subprocess   │
+    │  (isolated)   │      │  (isolated)   │      │  (isolated)   │
+    └───────────────┘      └───────────────┘      └───────────────┘
+```
+
+### Flow
+
+1. **GPU Detection**: Automatically detects AMD (ROCm) or NVIDIA GPUs
+2. **Worker Creation**: Creates N worker threads, each with dedicated GPUs
+3. **Queue Population**: All tests go into a shared work queue
+4. **Dynamic Dispatch**: Workers pull tests from the queue as they finish
+5. **Subprocess Isolation**: Each test runs in its own subprocess
+6. **Error Handling**: GPU errors trigger retry on different workers
+7. **Result Reporting**: Results stream back to pytest as tests complete
 
 ## Example Output
 
 ```
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_forward PASSED
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b_a2b_generation 💥
+🚀 pytest-fkit: 4 workers, 8 AMD GPUs, 2 GPU(s)/worker
+   GPU allocations: ['0,1', '2,3', '4,5', '6,7']
+   Dynamic scheduling: tests assigned to first available worker
+
+🔄 Running 1000 tests across 4 workers (dynamic scheduling)...
+
+tests/models/bert/test_modeling_bert.py::BertModelTest::test_forward PASSED
+tests/models/llama/test_modeling_llama.py::LlamaModelTest::test_forward PASSED
+   🔄 Retrying test_model_15b on another worker (attempt 2)
+tests/models/whisper/test_modeling_whisper.py::WhisperModelTest::test_forward PASSED
+⚠️  Worker 2 (GPUs: 4,5) disabled after 3 consecutive GPU errors
 
 ======================================================================
-💥 TEST CRASHED: SIGABRT (Aborted)
+✅ Completed 1000 tests
+   Passed: 950, Failed: 45, Skipped: 5
+   💥 Crashes: 2
+   🎮 GPU errors: 8 (retries: 5)
+   ⚠️  Workers disabled: 1
 ======================================================================
-
-This test caused Python to crash with SIGABRT (Aborted).
-pytest-fkit caught it and converted it to an ERROR.
-
---- STDOUT ---
-...test output...
-
---- STDERR ---
-Fatal Python error: Aborted
-...crash traceback...
-======================================================================
-
-tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_backward PASSED
 
 =============== pytest-fkit summary ===============
-💥 1 test(s) CRASHED (converted to ERROR by pytest-fkit):
-  - tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b_a2b_generation
+💥 2 test(s) CRASHED (converted to ERROR by pytest-fkit):
+  - tests/models/dots1/test_modeling_dots1.py::Dots1ModelTest::test_model_15b
 
-✅ pytest-fkit prevented 1 crashes from killing your test suite!
+✅ pytest-fkit prevented 2 crashes from killing your test suite!
 ```
+
+## Command Line Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--fkit` | `False` | Enable crash isolation |
+| `--fkit-timeout` | `600` | Timeout per test in seconds |
+| `--fkit-workers` | `1` | Number of parallel workers (`auto` for GPU-based) |
+| `--fkit-gpus-per-worker` | `2` | GPUs assigned to each worker |
+
+## Environment Variables Set Per Worker
+
+| Variable | Description |
+|----------|-------------|
+| `CUDA_VISIBLE_DEVICES` | GPU IDs for NVIDIA / compatibility |
+| `HIP_VISIBLE_DEVICES` | GPU IDs for AMD ROCm |
+| `ROCR_VISIBLE_DEVICES` | GPU IDs for AMD ROCm runtime |
+| `FKIT_WORKER_ID` | Worker index (0, 1, 2, ...) |
+| `FKIT_GPU_IDS` | Assigned GPU IDs string |
+
+## GPU Error Patterns Detected
+
+The following error patterns trigger automatic retry on a different worker:
+
+- `CUDA out of memory`
+- `CUDA error` / `HIP error`
+- `hipErrorNoBinaryForGpu`
+- `hipErrorOutOfMemory`
+- `NCCL error`
+- `device-side assert`
+- `GPU not found` / `no GPU`
+- `cudaErrorNoDevice` / `hipErrorNoDevice`
 
 ## Performance Considerations
 
-- **Overhead**: Running each test in a subprocess adds overhead (~100-500ms per test)
-- **Best For**: Large test suites where crashes are occasional but catastrophic
-- **Not Recommended**: Tiny test suites with < 100 tests where crashes are rare
+- **Overhead**: ~100-500ms per test for subprocess spawning
+- **Parallelism**: N workers = ~N× throughput (minus overhead)
+- **GPU Memory**: Each worker has dedicated GPUs - no memory contention
+- **Dynamic Balancing**: Fast tests don't block slow tests
+- **Fault Tolerance**: Workers can fail without stopping the suite
 
-For the HuggingFace Transformers test suite with 100,000+ tests, the overhead is worth it to ensure all tests run to completion.
+### Recommended Configurations
 
-## Configuration
+| Scenario | Workers | GPUs/Worker | Command |
+|----------|---------|-------------|---------|
+| 8 GPUs, multi-GPU tests | 4 | 2 | `--fkit-workers=4 --fkit-gpus-per-worker=2` |
+| 8 GPUs, single-GPU tests | 8 | 1 | `--fkit-workers=8 --fkit-gpus-per-worker=1` |
+| 4 GPUs, mixed tests | 2 | 2 | `--fkit-workers=2 --fkit-gpus-per-worker=2` |
+| No GPUs (CPU tests) | auto | - | `--fkit-workers=auto` |
+| Unreliable GPUs | 4+ | 2 | Enable retry with more workers |
 
-You can also enable pytest-fkit in `pytest.ini` or `pyproject.toml`:
+## Configuration File
+
+Enable pytest-fkit in `pytest.ini` or `pyproject.toml`:
 
 ```ini
 # pytest.ini
 [pytest]
-addopts = --fkit --fkit-timeout=600
+addopts = --fkit --fkit-timeout=600 --fkit-workers=auto
 ```
 
 ```toml
 # pyproject.toml
 [tool.pytest.ini_options]
-addopts = ["--fkit", "--fkit-timeout=600"]
+addopts = ["--fkit", "--fkit-timeout=600", "--fkit-workers=auto"]
 ```
+
+## Comparison with pytest-xdist
+
+| Feature | pytest-fkit | pytest-xdist |
+|---------|-------------|--------------|
+| Crash isolation | ✅ Yes | ❌ No |
+| GPU affinity | ✅ Yes | ❌ Manual |
+| Parallel execution | ✅ Yes | ✅ Yes |
+| Dynamic scheduling | ✅ Yes | ✅ Yes |
+| GPU error retry | ✅ Yes | ❌ No |
+| Worker fault tolerance | ✅ Yes | ⚠️ Limited |
+| Memory isolation | ✅ Per-test | ⚠️ Per-worker |
+| Overhead | Higher | Lower |
+
+**Use pytest-fkit when:**
+- Tests can crash Python (GPU drivers, C extensions)
+- You need automatic GPU affinity
+- You need per-test isolation
+- GPU availability is unreliable
+- You want automatic retry on GPU errors
+
+**Use pytest-xdist when:**
+- Tests are stable (no crashes)
+- You need minimal overhead
+- Tests don't use GPUs
 
 ## Compatibility
 
 - Python 3.8+
 - pytest 6.0+
 - Linux, macOS (Windows support TBD)
+- AMD ROCm GPUs (detected via `rocm-smi`)
+- NVIDIA GPUs (detected via `nvidia-smi`)
 
 ## License
 
