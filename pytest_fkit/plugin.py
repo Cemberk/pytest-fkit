@@ -4,9 +4,20 @@ pytest-fkit plugin: Isolate test crashes and convert them to ERROR results
 Inspired by fkitpy - when tests crash (SIGABRT, SIGSEGV, etc.),
 catch them and report as normal pytest errors instead of killing the entire run.
 
-This plugin runs each test in a subprocess to isolate crashes.
+This plugin supports two execution modes:
+
+1. BATCH MODE (default, recommended for speed):
+   - Tests are sliced upfront and distributed to workers
+   - Each worker runs its entire slice in a SINGLE subprocess
+   - Much faster due to reduced subprocess overhead
+   - Use --fkit-batch (default) or --fkit-mode=batch
+
+2. ISOLATION MODE (for maximum crash isolation):
+   - Each test runs in its own subprocess
+   - Slower but provides per-test crash isolation
+   - Use --fkit-mode=isolate
+
 Supports parallel workers with GPU affinity for multi-GPU systems.
-Uses dynamic work queue scheduling - tests are assigned to the first available worker.
 """
 import sys
 import os
@@ -18,9 +29,11 @@ import time
 import threading
 import queue
 import re
+import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Callable
+from typing import List, Optional, Dict, Callable, Tuple
 from enum import Enum
 
 
@@ -54,6 +67,27 @@ def pytest_addoption(parser):
         default=2,
         help="GPUs assigned to each worker (default: 2 for multi-GPU test support)",
     )
+    group.addoption(
+        "--fkit-mode",
+        action="store",
+        type=str,
+        default="batch",
+        choices=["batch", "isolate"],
+        help="Execution mode: 'batch' (fast, slice tests per worker) or 'isolate' (slow, one subprocess per test)",
+    )
+    group.addoption(
+        "--fkit-threads-per-worker",
+        action="store",
+        type=str,
+        default="auto",
+        help="CPU threads per worker for OMP/MKL (default: auto = total_cores/num_workers)",
+    )
+    group.addoption(
+        "--fkit-batch",
+        action="store_true",
+        default=False,
+        help="[DEPRECATED] Use batch mode (now default). Use --fkit-mode=isolate for per-test isolation.",
+    )
 
 
 def pytest_configure(config):
@@ -82,6 +116,48 @@ class GPUInfo:
     count: int
     vendor: str  # 'amd', 'nvidia', or 'none'
     ids: List[str]
+
+
+@dataclass
+class CPUInfo:
+    """Information about available CPU cores."""
+    total_cores: int
+    physical_cores: int
+
+
+def detect_cpus() -> CPUInfo:
+    """Detect available CPU cores."""
+    import multiprocessing
+    
+    total_cores = multiprocessing.cpu_count()
+    
+    # Try to get physical cores (excluding hyperthreading)
+    physical_cores = total_cores
+    try:
+        import os
+        # Linux: count physical cores
+        if os.path.exists('/proc/cpuinfo'):
+            with open('/proc/cpuinfo') as f:
+                content = f.read()
+                # Count unique physical id + core id combinations
+                physical_ids = set()
+                current_physical = None
+                current_core = None
+                for line in content.split('\n'):
+                    if line.startswith('physical id'):
+                        current_physical = line.split(':')[1].strip()
+                    elif line.startswith('core id'):
+                        current_core = line.split(':')[1].strip()
+                        if current_physical is not None and current_core is not None:
+                            physical_ids.add((current_physical, current_core))
+                            current_physical = None
+                            current_core = None
+                if physical_ids:
+                    physical_cores = len(physical_ids)
+    except Exception:
+        pass
+    
+    return CPUInfo(total_cores=total_cores, physical_cores=physical_cores)
 
 
 def detect_gpus() -> GPUInfo:
@@ -213,6 +289,37 @@ class WorkItem:
     max_retries: int = 1  # Allow 1 retry on GPU errors
 
 
+def slice_tests_to_workers(items: List, num_workers: int) -> List[List]:
+    """
+    Distribute tests across workers using round-robin for balance.
+    
+    This ensures:
+    1. Deterministic distribution (same tests always go to same worker)
+    2. Even distribution regardless of test count
+    3. Sorted by nodeid for reproducibility
+    
+    Args:
+        items: List of pytest items to distribute
+        num_workers: Number of workers
+        
+    Returns:
+        List of lists, where slices[i] contains items for worker i
+    """
+    if num_workers <= 1:
+        return [items]
+    
+    # Sort by nodeid for deterministic distribution
+    sorted_items = sorted(items, key=lambda x: x.nodeid)
+    
+    # Round-robin distribution
+    slices = [[] for _ in range(num_workers)]
+    for i, item in enumerate(sorted_items):
+        worker_idx = i % num_workers
+        slices[worker_idx].append(item)
+    
+    return slices
+
+
 class DynamicWorkerPool:
     """
     Pool of workers with dynamic work queue scheduling.
@@ -225,12 +332,14 @@ class DynamicWorkerPool:
     """
     
     def __init__(self, num_workers: int, gpu_allocations: List[str], 
-                 gpu_vendor: str, timeout: int, result_callback: Callable):
+                 gpu_vendor: str, timeout: int, result_callback: Callable,
+                 threads_per_worker: int = 4):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
         self.timeout = timeout
         self.result_callback = result_callback
+        self.threads_per_worker = threads_per_worker
         
         # Work queue - tests waiting to be executed
         self.work_queue = queue.Queue()
@@ -265,10 +374,21 @@ class DynamicWorkerPool:
         self._workers = []
     
     def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
-        """Get GPU environment variables for a worker."""
+        """Get GPU and CPU environment variables for a worker."""
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
         
-        env_vars = {}
+        env_vars = {
+            # CPU thread settings - prevent workers from fighting for cores
+            'OMP_NUM_THREADS': str(self.threads_per_worker),
+            'MKL_NUM_THREADS': str(self.threads_per_worker),
+            'NUMEXPR_NUM_THREADS': str(self.threads_per_worker),
+            'OPENBLAS_NUM_THREADS': str(self.threads_per_worker),
+            'VECLIB_MAXIMUM_THREADS': str(self.threads_per_worker),
+            'TORCH_NUM_THREADS': str(self.threads_per_worker),
+            'FKIT_WORKER_ID': str(worker_id),
+            'FKIT_THREADS': str(self.threads_per_worker),
+        }
+        
         if gpu_ids:
             if self.gpu_vendor == 'amd':
                 env_vars['HIP_VISIBLE_DEVICES'] = gpu_ids
@@ -604,6 +724,407 @@ class DynamicWorkerPool:
                       if state not in (WorkerState.FAILED, WorkerState.STOPPED))
 
 
+class SlicedWorkerPool:
+    """
+    Pool of workers with pre-sliced test distribution and dynamic failover.
+    
+    Tests are distributed upfront using round-robin slicing:
+    1. Tests are sorted and sliced across workers deterministically
+    2. Each worker runs its slice of tests sequentially
+    3. Each test still runs in its own subprocess for crash isolation
+    4. Workers run in parallel for speed
+    5. If a worker encounters GPU errors, remaining tests go to overflow queue
+    6. Healthy workers pick up overflow tests when they finish their slice
+    
+    This provides:
+    - Deterministic distribution (reproducible test assignments)
+    - Crash isolation (subprocess per test)
+    - GPU affinity (each worker has dedicated GPUs)
+    - CPU thread affinity (each worker gets fair share of cores)
+    - Parallel execution across workers
+    - Dynamic failover for GPU failures
+    """
+    
+    def __init__(self, num_workers: int, gpu_allocations: List[str], 
+                 gpu_vendor: str, timeout: int, result_callback: Callable,
+                 threads_per_worker: int = 4):
+        self.num_workers = num_workers
+        self.gpu_allocations = gpu_allocations
+        self.gpu_vendor = gpu_vendor
+        self.timeout = timeout
+        self.result_callback = result_callback
+        self.threads_per_worker = threads_per_worker
+        
+        # Pre-sliced test lists for each worker
+        self._worker_slices: List[List] = []
+        
+        # Overflow queue for tests from failed workers
+        self._overflow_queue = queue.Queue()
+        
+        # Worker state tracking
+        self._worker_states = {i: WorkerState.IDLE for i in range(num_workers)}
+        self._worker_gpu_error_counts = {i: 0 for i in range(num_workers)}
+        self._max_gpu_errors = 3  # After this many GPU errors, worker moves tests to overflow
+        
+        # Statistics
+        self._lock = threading.Lock()
+        self._stats = {
+            'tests_run': 0,
+            'tests_passed': 0,
+            'tests_failed': 0,
+            'tests_skipped': 0,
+            'crashes': 0,
+            'timeouts': 0,
+            'gpu_errors': 0,
+            'redistributed': 0,
+            'workers_failed': 0,
+        }
+        
+        # Control flags
+        self._shutdown = threading.Event()
+        self._all_slices_done = threading.Event()
+        
+        # Worker threads
+        self._workers = []
+        
+        # Item map for result reporting
+        self._item_map = {}
+    
+    def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
+        """Get GPU and CPU environment variables for a worker."""
+        gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
+        
+        env_vars = {
+            # CPU thread settings - prevent workers from fighting for cores
+            'OMP_NUM_THREADS': str(self.threads_per_worker),
+            'MKL_NUM_THREADS': str(self.threads_per_worker),
+            'NUMEXPR_NUM_THREADS': str(self.threads_per_worker),
+            'OPENBLAS_NUM_THREADS': str(self.threads_per_worker),
+            'VECLIB_MAXIMUM_THREADS': str(self.threads_per_worker),
+            # PyTorch specific
+            'TORCH_NUM_THREADS': str(self.threads_per_worker),
+            # Worker identification
+            'FKIT_WORKER_ID': str(worker_id),
+            'FKIT_THREADS': str(self.threads_per_worker),
+        }
+        
+        if gpu_ids:
+            if self.gpu_vendor == 'amd':
+                env_vars['HIP_VISIBLE_DEVICES'] = gpu_ids
+                env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
+                env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
+            elif self.gpu_vendor == 'nvidia':
+                env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
+            env_vars['FKIT_GPU_IDS'] = gpu_ids
+        
+        return env_vars
+    
+    def _is_gpu_error(self, result: TestResult, stderr: str = "") -> bool:
+        """Detect if a failure was due to GPU issues."""
+        gpu_error_patterns = [
+            'CUDA out of memory', 'CUDA error', 'HIP error', 'ROCm error',
+            'GPU memory', 'hipErrorNoBinaryForGpu', 'hipErrorOutOfMemory',
+            'NCCL error', 'device-side assert', 'no GPU', 'GPU not found',
+            'cudaErrorNoDevice', 'hipErrorNoDevice', 'hipErrorInvalidDevice',
+            'RuntimeError: No HIP GPUs', 'RuntimeError: No CUDA GPUs',
+        ]
+        check_text = (result.longrepr or "") + stderr
+        return any(pattern.lower() in check_text.lower() for pattern in gpu_error_patterns)
+    
+    def _worker_loop(self, worker_id: int, test_slice: List):
+        """Main loop for a worker - runs its pre-assigned slice with GPU failover."""
+        gpu_env = self._get_gpu_env_vars(worker_id)
+        gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
+        
+        slice_size = len(test_slice)
+        print(f"   Worker {worker_id} (GPUs: {gpu_str}): {slice_size} tests")
+        
+        with self._lock:
+            self._worker_states[worker_id] = WorkerState.RUNNING
+        
+        consecutive_gpu_errors = 0
+        
+        for idx, item in enumerate(test_slice):
+            if self._shutdown.is_set():
+                break
+            
+            # Check if this worker should stop due to GPU errors
+            if consecutive_gpu_errors >= self._max_gpu_errors:
+                # Move remaining tests to overflow queue for healthy workers
+                remaining = test_slice[idx:]
+                with self._lock:
+                    self._stats['redistributed'] += len(remaining)
+                    self._stats['workers_failed'] += 1
+                    self._worker_states[worker_id] = WorkerState.FAILED
+                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): GPU errors detected, "
+                      f"redistributing {len(remaining)} remaining tests")
+                for remaining_item in remaining:
+                    self._overflow_queue.put(remaining_item)
+                return
+            
+            # Run the test in subprocess (crash isolation)
+            result = self._run_test(item.nodeid, worker_id, gpu_env)
+            
+            # Check for GPU errors
+            if result.outcome == 'failed' and self._is_gpu_error(result):
+                consecutive_gpu_errors += 1
+                with self._lock:
+                    self._stats['gpu_errors'] += 1
+            else:
+                consecutive_gpu_errors = 0  # Reset on success
+            
+            # Update stats
+            with self._lock:
+                self._stats['tests_run'] += 1
+                if result.outcome == 'passed':
+                    self._stats['tests_passed'] += 1
+                elif result.outcome == 'skipped':
+                    self._stats['tests_skipped'] += 1
+                else:
+                    self._stats['tests_failed'] += 1
+                if result.crash:
+                    self._stats['crashes'] += 1
+                if result.timeout:
+                    self._stats['timeouts'] += 1
+            
+            # Report result via callback
+            self.result_callback(item, result)
+        
+        with self._lock:
+            self._worker_states[worker_id] = WorkerState.STOPPED
+        
+        # After finishing slice, help with overflow queue
+        self._process_overflow(worker_id, gpu_env)
+    
+    def _process_overflow(self, worker_id: int, gpu_env: Dict[str, str]):
+        """Process tests from overflow queue (from failed workers)."""
+        gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
+        
+        while not self._shutdown.is_set():
+            try:
+                item = self._overflow_queue.get_nowait()
+            except queue.Empty:
+                break
+            
+            print(f"   Worker {worker_id} (GPUs: {gpu_str}): picking up redistributed test")
+            result = self._run_test(item.nodeid, worker_id, gpu_env)
+            
+            with self._lock:
+                self._stats['tests_run'] += 1
+                if result.outcome == 'passed':
+                    self._stats['tests_passed'] += 1
+                elif result.outcome == 'skipped':
+                    self._stats['tests_skipped'] += 1
+                else:
+                    self._stats['tests_failed'] += 1
+                if result.crash:
+                    self._stats['crashes'] += 1
+                if result.timeout:
+                    self._stats['timeouts'] += 1
+            
+            self.result_callback(item, result)
+            self._overflow_queue.task_done()
+    
+    def _run_test(self, nodeid: str, worker_id: int, gpu_env: Dict[str, str]) -> TestResult:
+        """Run a single test in an isolated subprocess."""
+        junit_fd, junit_path = tempfile.mkstemp(suffix='.xml', prefix=f'fkit_w{worker_id}_')
+        os.close(junit_fd)
+        
+        try:
+            start_time = time.time()
+            
+            # Prepare environment
+            env = os.environ.copy()
+            env.update(gpu_env)
+            
+            # Preserve critical variables
+            critical_vars = ['HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
+                           'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
+                           'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE']
+            for var in critical_vars:
+                if var in os.environ:
+                    env[var] = os.environ[var]
+            
+            # Build pytest command
+            pytest_cmd = [
+                sys.executable, '-m', 'pytest',
+                nodeid,
+                '-v',
+                '--tb=short',
+                '--continue-on-collection-errors',
+                '-p', 'no:cacheprovider',
+                '-p', 'no:fkit',  # Disable fkit in subprocess to prevent recursion
+                f'--junitxml={junit_path}',
+            ]
+            
+            try:
+                result = subprocess.run(
+                    pytest_cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.timeout,
+                    cwd=str(Path.cwd()),
+                    env=env,
+                )
+                
+                duration = time.time() - start_time
+                outcome, skip_reason = self._parse_junit_result(junit_path)
+                
+                if result.returncode == 0:
+                    if outcome == 'skipped':
+                        return TestResult(
+                            nodeid=nodeid,
+                            outcome='skipped',
+                            duration=duration,
+                            skip_reason=skip_reason,
+                            worker_id=worker_id
+                        )
+                    else:
+                        return TestResult(
+                            nodeid=nodeid,
+                            outcome='passed',
+                            duration=duration,
+                            worker_id=worker_id
+                        )
+                
+                elif result.returncode < 0:
+                    # Process killed by signal - CRASH!
+                    signal_num = -result.returncode
+                    signal_names = {
+                        signal.SIGABRT: "SIGABRT (Aborted)",
+                        signal.SIGSEGV: "SIGSEGV (Segmentation Fault)",
+                        signal.SIGTERM: "SIGTERM (Terminated)",
+                        signal.SIGKILL: "SIGKILL (Killed)",
+                    }
+                    signal_name = signal_names.get(signal_num, f"Signal {signal_num}")
+                    
+                    crash_info = (
+                        f"\n{'='*70}\n"
+                        f"💥 TEST CRASHED: {signal_name} (Worker {worker_id}, GPUs: {gpu_env.get('FKIT_GPU_IDS', 'N/A')})\n"
+                        f"{'='*70}\n"
+                        f"\nThis test caused Python to crash with {signal_name}.\n"
+                        f"pytest-fkit caught it and converted it to an ERROR.\n"
+                        f"\n--- STDOUT ---\n{result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout}\n"
+                        f"\n--- STDERR ---\n{result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr}\n"
+                        f"{'='*70}\n"
+                    )
+                    
+                    return TestResult(
+                        nodeid=nodeid,
+                        outcome='failed',
+                        duration=duration,
+                        longrepr=crash_info,
+                        crash=True,
+                        worker_id=worker_id
+                    )
+                
+                else:
+                    # Normal failure
+                    fail_info = f"\n--- STDOUT ---\n{result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout}\n\n--- STDERR ---\n{result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr}"
+                    return TestResult(
+                        nodeid=nodeid,
+                        outcome='failed',
+                        duration=duration,
+                        longrepr=fail_info,
+                        worker_id=worker_id
+                    )
+            
+            except subprocess.TimeoutExpired as e:
+                duration = time.time() - start_time
+                
+                timeout_info = (
+                    f"\n{'='*70}\n"
+                    f"⏱️  TEST TIMEOUT (Worker {worker_id})\n"
+                    f"{'='*70}\n"
+                    f"\nTest exceeded timeout of {self.timeout} seconds.\n"
+                    f"pytest-fkit terminated it and converted it to an ERROR.\n"
+                    f"\n--- PARTIAL STDOUT ---\n{e.stdout if e.stdout else '(none)'}\n"
+                    f"\n--- PARTIAL STDERR ---\n{e.stderr if e.stderr else '(none)'}\n"
+                    f"{'='*70}\n"
+                )
+                
+                return TestResult(
+                    nodeid=nodeid,
+                    outcome='failed',
+                    duration=duration,
+                    longrepr=timeout_info,
+                    timeout=True,
+                    worker_id=worker_id
+                )
+        
+        finally:
+            try:
+                os.unlink(junit_path)
+            except:
+                pass
+    
+    def _parse_junit_result(self, junit_path: str) -> Tuple[str, Optional[str]]:
+        """Parse JUnit XML for outcome and skip reason."""
+        try:
+            if not os.path.exists(junit_path):
+                return 'unknown', None
+            
+            tree = ET.parse(junit_path)
+            root = tree.getroot()
+            
+            for testcase in root.findall('.//testcase'):
+                skipped = testcase.find('skipped')
+                if skipped is not None:
+                    reason = skipped.get('message') or skipped.text or "Skipped"
+                    return 'skipped', reason
+                
+                if testcase.find('failure') is not None or testcase.find('error') is not None:
+                    return 'failed', None
+                
+                return 'passed', None
+            
+            return 'unknown', None
+        except Exception:
+            return 'unknown', None
+    
+    def submit_tests(self, items: List):
+        """Slice and distribute tests to workers."""
+        self._worker_slices = slice_tests_to_workers(items, self.num_workers)
+        self._item_map = {item.nodeid: item for item in items}
+        
+        # Print distribution info
+        print(f"\n📊 Test distribution across {self.num_workers} workers:")
+        for i, slice_items in enumerate(self._worker_slices):
+            print(f"   Worker {i}: {len(slice_items)} tests")
+    
+    def start(self):
+        """Start all worker threads with their pre-assigned slices."""
+        for worker_id in range(self.num_workers):
+            test_slice = self._worker_slices[worker_id] if worker_id < len(self._worker_slices) else []
+            if not test_slice:
+                continue
+                
+            thread = threading.Thread(
+                target=self._worker_loop,
+                args=(worker_id, test_slice),
+                name=f"fkit-worker-{worker_id}",
+                daemon=True
+            )
+            self._workers.append(thread)
+            thread.start()
+    
+    def wait_for_completion(self):
+        """Wait for all workers to complete their slices."""
+        for thread in self._workers:
+            thread.join()
+    
+    def shutdown(self):
+        """Force shutdown all workers."""
+        self._shutdown.set()
+        for thread in self._workers:
+            thread.join(timeout=1.0)
+    
+    @property
+    def stats(self):
+        with self._lock:
+            return dict(self._stats)
+
+
 class CrashIsolationPlugin:
     """Plugin that runs tests in subprocess workers to catch crashes."""
     
@@ -611,12 +1132,15 @@ class CrashIsolationPlugin:
         self.config = config
         self.timeout = config.getoption("--fkit-timeout")
         self.gpus_per_worker = config.getoption("--fkit-gpus-per-worker")
+        self.execution_mode = config.getoption("--fkit-mode")
+        threads_per_worker_opt = config.getoption("--fkit-threads-per-worker")
         
         # Parse worker count
         workers_opt = config.getoption("--fkit-workers")
         
-        # Detect GPUs
+        # Detect GPUs and CPUs
         self.gpu_info = detect_gpus()
+        self.cpu_info = detect_cpus()
         
         if workers_opt == 'auto':
             # Auto-detect based on GPUs
@@ -624,10 +1148,18 @@ class CrashIsolationPlugin:
                 self.num_workers = max(1, self.gpu_info.count // self.gpus_per_worker)
             else:
                 # No GPUs - use CPU count
-                import multiprocessing
-                self.num_workers = max(1, multiprocessing.cpu_count() // 2)
+                self.num_workers = max(1, self.cpu_info.total_cores // 2)
         else:
             self.num_workers = max(1, int(workers_opt))
+        
+        # Calculate threads per worker
+        if threads_per_worker_opt == 'auto':
+            # Distribute CPU cores evenly across workers
+            # Use physical cores if available to avoid hyperthreading contention
+            available_cores = self.cpu_info.physical_cores or self.cpu_info.total_cores
+            self.threads_per_worker = max(1, available_cores // self.num_workers)
+        else:
+            self.threads_per_worker = max(1, int(threads_per_worker_opt))
         
         # Allocate GPUs to workers
         self.gpu_allocations = allocate_gpus_to_workers(
@@ -646,15 +1178,26 @@ class CrashIsolationPlugin:
         # Worker pool (created later with callback)
         self.worker_pool = None
         
+        # Determine scheduling mode description
+        if self.execution_mode == 'batch':
+            scheduling_desc = "sliced scheduling (tests pre-distributed to workers)"
+        else:
+            scheduling_desc = "dynamic scheduling (tests assigned on-demand)"
+        
         # Print configuration
         if self.gpu_info.count > 0:
             print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
                   f"{self.gpu_info.count} {self.gpu_info.vendor.upper()} GPUs, "
-                  f"{self.gpus_per_worker} GPU(s)/worker")
+                  f"{self.gpus_per_worker} GPU(s)/worker, "
+                  f"{self.threads_per_worker} CPU threads/worker")
             print(f"   GPU allocations: {self.gpu_allocations}")
-            print(f"   Dynamic scheduling: tests assigned to first available worker")
+            print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
+            print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
         else:
-            print(f"\n🚀 pytest-fkit: {self.num_workers} workers (no GPU detected)")
+            print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
+                  f"{self.threads_per_worker} CPU threads/worker (no GPU detected)")
+            print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
+            print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
     
     def _result_callback(self, item, result: TestResult):
         """Callback for when a test completes."""
@@ -671,30 +1214,46 @@ class CrashIsolationPlugin:
     
     @pytest.hookimpl(tryfirst=True)
     def pytest_runtestloop(self, session):
-        """Override test loop for parallel execution with dynamic scheduling."""
+        """Override test loop for parallel execution with sliced or dynamic scheduling."""
         if not self._parallel_mode:
             return None
         
         if not self._collected_items:
             return None
         
-        print(f"\n🔄 Running {len(self._collected_items)} tests across {self.num_workers} workers "
-              f"(dynamic scheduling)...\n")
+        # Choose worker pool based on execution mode
+        if self.execution_mode == 'batch':
+            # Sliced mode: tests are pre-distributed to workers
+            print(f"\n🔄 Running {len(self._collected_items)} tests across {self.num_workers} workers "
+                  f"(sliced scheduling - each worker gets 1/{self.num_workers} of tests)...\n")
+            
+            self.worker_pool = SlicedWorkerPool(
+                num_workers=self.num_workers,
+                gpu_allocations=self.gpu_allocations,
+                gpu_vendor=self.gpu_info.vendor,
+                timeout=self.timeout,
+                result_callback=self._result_callback,
+                threads_per_worker=self.threads_per_worker
+            )
+        else:
+            # Dynamic mode: tests are assigned to workers on-demand
+            print(f"\n🔄 Running {len(self._collected_items)} tests across {self.num_workers} workers "
+                  f"(dynamic scheduling)...\n")
+            
+            self.worker_pool = DynamicWorkerPool(
+                num_workers=self.num_workers,
+                gpu_allocations=self.gpu_allocations,
+                gpu_vendor=self.gpu_info.vendor,
+                timeout=self.timeout,
+                result_callback=self._result_callback,
+                threads_per_worker=self.threads_per_worker
+            )
         
-        # Create worker pool with callback
-        self.worker_pool = DynamicWorkerPool(
-            num_workers=self.num_workers,
-            gpu_allocations=self.gpu_allocations,
-            gpu_vendor=self.gpu_info.vendor,
-            timeout=self.timeout,
-            result_callback=self._result_callback
-        )
+        # Submit all tests (sliced or queued depending on pool type)
+        self.worker_pool.submit_tests(self._collected_items)
         
         # Start workers
         self.worker_pool.start()
-        
-        # Submit all tests to the queue
-        self.worker_pool.submit_tests(self._collected_items)
         
         # Wait for completion
         try:

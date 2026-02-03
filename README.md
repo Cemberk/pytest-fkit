@@ -6,8 +6,9 @@ When a test crashes Python (SIGABRT, SIGSEGV, etc.), it catches the crash and co
 
 **Features:**
 - Parallel workers with GPU affinity
-- Dynamic work queue scheduling (tests go to first available worker)
-- Automatic GPU error detection and retry on different workers
+- **Sliced test distribution** (default) - tests are pre-distributed across workers for deterministic, efficient execution
+- Crash isolation - each test runs in its own subprocess
+- Automatic GPU error detection and retry
 - Fault tolerance (workers can fail without stopping the test run)
 
 ## The Problem
@@ -60,9 +61,9 @@ Set a timeout per test (default is 600 seconds / 10 minutes):
 pytest --fkit --fkit-timeout=300  # 5 minute timeout per test
 ```
 
-### Parallel Workers with Dynamic Scheduling
+### Parallel Workers with Sliced Distribution
 
-Run tests in parallel with automatic work distribution:
+Run tests in parallel with automatic slicing:
 
 ```bash
 # Auto-detect workers based on GPU count
@@ -75,11 +76,32 @@ pytest --fkit --fkit-workers=4
 pytest --fkit --fkit-workers=4 --fkit-gpus-per-worker=2
 ```
 
-**Dynamic Scheduling**: Tests are NOT pre-assigned to workers. Instead:
-1. All tests go into a shared work queue
-2. Workers pull tests as they become available
-3. First available worker gets the next test
-4. Automatic load balancing across workers
+**Sliced Scheduling (default)**: Tests are pre-distributed across workers:
+1. Tests are sorted by nodeid for reproducibility
+2. Round-robin distribution: test[i] goes to worker[i % num_workers]
+3. Each worker runs its slice with crash isolation (subprocess per test)
+4. Workers run in parallel for maximum throughput
+
+**Example with 4 workers and 100 tests:**
+- Worker 0: tests 0, 4, 8, 12, ... (25 tests)
+- Worker 1: tests 1, 5, 9, 13, ... (25 tests)
+- Worker 2: tests 2, 6, 10, 14, ... (25 tests)
+- Worker 3: tests 3, 7, 11, 15, ... (25 tests)
+
+### Execution Modes
+
+```bash
+# Batch mode (default) - pre-sliced, deterministic distribution
+pytest --fkit --fkit-workers=4 --fkit-mode=batch
+
+# Isolate mode - dynamic queue, on-demand assignment
+pytest --fkit --fkit-workers=4 --fkit-mode=isolate
+```
+
+| Mode | Description | Best For |
+|------|-------------|----------|
+| `batch` | Tests pre-sliced to workers | Most use cases, reproducible |
+| `isolate` | Dynamic work queue | Highly variable test durations |
 
 ### GPU Allocation Examples
 
@@ -101,28 +123,24 @@ pytest --fkit --fkit-workers=8 --fkit-gpus-per-worker=1
 # Worker 7: GPU 7
 ```
 
-### Fault Tolerance
+### Crash Isolation
 
-pytest-fkit handles GPU failures gracefully:
+Each test runs in its own subprocess, so crashes are contained:
 
-1. **GPU Error Detection**: Automatically detects GPU-related errors (CUDA OOM, HIP errors, etc.)
-
-2. **Automatic Retry**: If a test fails due to GPU errors, it's automatically retried on a different worker
-
-3. **Worker Disabling**: If a worker encounters 3+ consecutive GPU errors, it's disabled and remaining tests are scheduled to healthy workers
-
-4. **No Test Loss**: Even if GPUs are missing or workers fail, all tests will eventually run on available workers
+1. **Crash Detection**: SIGABRT, SIGSEGV, and other signals are caught
+2. **Error Conversion**: Crashes are converted to pytest ERROR results
+3. **Suite Continuation**: Remaining tests continue running on the worker
+4. **Full Results**: You get a complete report even if some tests crash
 
 **Example scenario:**
 ```
-Worker 0 (GPU 0,1): Running tests...
-Worker 1 (GPU 2,3): Running tests...
-Worker 2 (GPU 4,5): ⚠️ GPU 4 missing - CUDA error
-                   → Test retried on Worker 0
-Worker 3 (GPU 6,7): Running tests...
+Worker 0 (GPU 0,1): test_bert PASSED → test_llama PASSED → test_crash 💥 CRASH → test_gpt2 PASSED
+Worker 1 (GPU 2,3): test_vit PASSED → test_whisper PASSED → test_t5 PASSED
+Worker 2 (GPU 4,5): test_clip PASSED → test_blip PASSED → test_stable PASSED
+Worker 3 (GPU 6,7): test_sam PASSED → test_dino PASSED → test_mae PASSED
 
-# Worker 2 disabled after 3 GPU errors
-# Remaining tests automatically go to Workers 0, 1, 3
+# Crash on Worker 0 is isolated - other tests continue
+# Final report shows 1 crash, 11 passed
 ```
 
 ### Skip Crash Isolation for Specific Tests
@@ -158,64 +176,74 @@ def test_simple_forward():
 
 ## How It Works
 
-### Architecture
+### Architecture (Batch Mode - Default)
 
 ```
-                    ┌─────────────────────────────────────┐
-                    │          Shared Work Queue          │
-                    │  [test1, test2, test3, test4, ...]  │
-                    └──────────────┬──────────────────────┘
+              ┌─────────────────────────────────────────────┐
+              │           Test Collection (sorted)          │
+              │  [test0, test1, test2, test3, test4, ...]   │
+              └────────────────────┬────────────────────────┘
                                    │
-            ┌──────────────────────┼──────────────────────┐
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
-    │   Worker 0    │      │   Worker 1    │      │   Worker 2    │
-    │  GPU 0,1      │      │  GPU 2,3      │      │  GPU 4,5      │
-    │               │      │               │      │               │
-    │  Pull next    │      │  Pull next    │      │  Pull next    │
-    │  available    │      │  available    │      │  available    │
-    │  test         │      │  test         │      │  test         │
-    └───────┬───────┘      └───────┬───────┘      └───────┬───────┘
-            │                      │                      │
-            ▼                      ▼                      ▼
-    ┌───────────────┐      ┌───────────────┐      ┌───────────────┐
-    │  Subprocess   │      │  Subprocess   │      │  Subprocess   │
-    │  (isolated)   │      │  (isolated)   │      │  (isolated)   │
-    └───────────────┘      └───────────────┘      └───────────────┘
+                        Round-Robin Slicing
+                                   │
+         ┌─────────────────────────┼─────────────────────────┐
+         │                         │                         │
+         ▼                         ▼                         ▼
+ ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+ │   Worker 0    │         │   Worker 1    │         │   Worker 2    │
+ │   GPU 0,1     │         │   GPU 2,3     │         │   GPU 4,5     │
+ ├───────────────┤         ├───────────────┤         ├───────────────┤
+ │ Slice:        │         │ Slice:        │         │ Slice:        │
+ │  test0        │         │  test1        │         │  test2        │
+ │  test3        │         │  test4        │         │  test5        │
+ │  test6        │         │  test7        │         │  test8        │
+ │  ...          │         │  ...          │         │  ...          │
+ └───────┬───────┘         └───────┬───────┘         └───────┬───────┘
+         │                         │                         │
+         ▼                         ▼                         ▼
+ ┌───────────────┐         ┌───────────────┐         ┌───────────────┐
+ │  Subprocess   │         │  Subprocess   │         │  Subprocess   │
+ │  per test     │         │  per test     │         │  per test     │
+ │  (isolated)   │         │  (isolated)   │         │  (isolated)   │
+ └───────────────┘         └───────────────┘         └───────────────┘
 ```
 
 ### Flow
 
 1. **GPU Detection**: Automatically detects AMD (ROCm) or NVIDIA GPUs
 2. **Worker Creation**: Creates N worker threads, each with dedicated GPUs
-3. **Queue Population**: All tests go into a shared work queue
-4. **Dynamic Dispatch**: Workers pull tests from the queue as they finish
-5. **Subprocess Isolation**: Each test runs in its own subprocess
-6. **Error Handling**: GPU errors trigger retry on different workers
-7. **Result Reporting**: Results stream back to pytest as tests complete
+3. **Test Slicing**: Tests sorted and distributed via round-robin
+4. **Parallel Execution**: Each worker runs its slice independently
+5. **Subprocess Isolation**: Each test runs in its own subprocess (crash protection)
+6. **Result Reporting**: Results stream back to pytest as tests complete
 
 ## Example Output
 
 ```
 🚀 pytest-fkit: 4 workers, 8 AMD GPUs, 2 GPU(s)/worker
    GPU allocations: ['0,1', '2,3', '4,5', '6,7']
-   Dynamic scheduling: tests assigned to first available worker
+   Mode: batch - sliced scheduling (tests pre-distributed to workers)
 
-🔄 Running 1000 tests across 4 workers (dynamic scheduling)...
+🔄 Running 1000 tests across 4 workers (sliced scheduling - each worker gets 1/4 of tests)...
+
+📊 Test distribution across 4 workers:
+   Worker 0: 250 tests
+   Worker 1: 250 tests
+   Worker 2: 250 tests
+   Worker 3: 250 tests
+   Worker 0 (GPUs: 0,1): 250 tests
+   Worker 1 (GPUs: 2,3): 250 tests
+   Worker 2 (GPUs: 4,5): 250 tests
+   Worker 3 (GPUs: 6,7): 250 tests
 
 tests/models/bert/test_modeling_bert.py::BertModelTest::test_forward PASSED
 tests/models/llama/test_modeling_llama.py::LlamaModelTest::test_forward PASSED
-   🔄 Retrying test_model_15b on another worker (attempt 2)
 tests/models/whisper/test_modeling_whisper.py::WhisperModelTest::test_forward PASSED
-⚠️  Worker 2 (GPUs: 4,5) disabled after 3 consecutive GPU errors
 
 ======================================================================
 ✅ Completed 1000 tests
    Passed: 950, Failed: 45, Skipped: 5
    💥 Crashes: 2
-   🎮 GPU errors: 8 (retries: 5)
-   ⚠️  Workers disabled: 1
 ======================================================================
 
 =============== pytest-fkit summary ===============
@@ -233,6 +261,7 @@ tests/models/whisper/test_modeling_whisper.py::WhisperModelTest::test_forward PA
 | `--fkit-timeout` | `600` | Timeout per test in seconds |
 | `--fkit-workers` | `1` | Number of parallel workers (`auto` for GPU-based) |
 | `--fkit-gpus-per-worker` | `2` | GPUs assigned to each worker |
+| `--fkit-mode` | `batch` | `batch` (pre-sliced) or `isolate` (dynamic queue) |
 
 ## Environment Variables Set Per Worker
 
@@ -262,18 +291,18 @@ The following error patterns trigger automatic retry on a different worker:
 - **Overhead**: ~100-500ms per test for subprocess spawning
 - **Parallelism**: N workers = ~N× throughput (minus overhead)
 - **GPU Memory**: Each worker has dedicated GPUs - no memory contention
-- **Dynamic Balancing**: Fast tests don't block slow tests
-- **Fault Tolerance**: Workers can fail without stopping the suite
+- **Deterministic**: Same test distribution every run (batch mode)
+- **Crash Isolation**: One crash doesn't affect other tests
 
 ### Recommended Configurations
 
-| Scenario | Workers | GPUs/Worker | Command |
-|----------|---------|-------------|---------|
-| 8 GPUs, multi-GPU tests | 4 | 2 | `--fkit-workers=4 --fkit-gpus-per-worker=2` |
-| 8 GPUs, single-GPU tests | 8 | 1 | `--fkit-workers=8 --fkit-gpus-per-worker=1` |
-| 4 GPUs, mixed tests | 2 | 2 | `--fkit-workers=2 --fkit-gpus-per-worker=2` |
-| No GPUs (CPU tests) | auto | - | `--fkit-workers=auto` |
-| Unreliable GPUs | 4+ | 2 | Enable retry with more workers |
+| Scenario | Workers | GPUs/Worker | Mode | Command |
+|----------|---------|-------------|------|---------|
+| 8 GPUs, multi-GPU tests | 4 | 2 | batch | `--fkit-workers=4 --fkit-gpus-per-worker=2` |
+| 8 GPUs, single-GPU tests | 8 | 1 | batch | `--fkit-workers=8 --fkit-gpus-per-worker=1` |
+| 4 GPUs, mixed tests | 2 | 2 | batch | `--fkit-workers=2 --fkit-gpus-per-worker=2` |
+| No GPUs (CPU tests) | auto | - | batch | `--fkit-workers=auto` |
+| Highly variable durations | 4 | 2 | isolate | `--fkit-workers=4 --fkit-mode=isolate` |
 
 ## Configuration File
 
@@ -295,13 +324,14 @@ addopts = ["--fkit", "--fkit-timeout=600", "--fkit-workers=auto"]
 
 | Feature | pytest-fkit | pytest-xdist |
 |---------|-------------|--------------|
-| Crash isolation | ✅ Yes | ❌ No |
-| GPU affinity | ✅ Yes | ❌ Manual |
+| Crash isolation | ✅ Yes (per-test subprocess) | ❌ No |
+| GPU affinity | ✅ Yes (automatic) | ❌ Manual |
 | Parallel execution | ✅ Yes | ✅ Yes |
-| Dynamic scheduling | ✅ Yes | ✅ Yes |
-| GPU error retry | ✅ Yes | ❌ No |
+| Sliced scheduling | ✅ Yes (round-robin) | ✅ Yes (load-based) |
+| GPU error retry | ✅ Yes (isolate mode) | ❌ No |
 | Worker fault tolerance | ✅ Yes | ⚠️ Limited |
 | Memory isolation | ✅ Per-test | ⚠️ Per-worker |
+| Reproducible distribution | ✅ Yes (deterministic) | ⚠️ Varies |
 | Overhead | Higher | Lower |
 
 **Use pytest-fkit when:**
