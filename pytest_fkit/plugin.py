@@ -289,6 +289,104 @@ class WorkItem:
     max_retries: int = 1  # Allow 1 retry on GPU errors
 
 
+def _extract_failure_from_output(stdout: str, stderr: str) -> str:
+    """Extract the meaningful failure message from pytest subprocess output.
+    
+    Instead of dumping the entire raw stdout/stderr (which includes the pytest
+    session header, progress bars, etc.), this extracts just the failure section.
+    Falls back to truncated raw output if extraction fails.
+    """
+    # Try to find the FAILURES section in pytest output
+    fail_sections = []
+    
+    # Pattern 1: pytest's FAILURES section
+    if '= FAILURES =' in stdout or '_ FAILURES _' in stdout:
+        # Extract from FAILURES marker to the next section marker or end
+        lines = stdout.split('\n')
+        in_failures = False
+        for line in lines:
+            if '= FAILURES =' in line or '_ FAILURES _' in line:
+                in_failures = True
+                continue
+            if in_failures:
+                # Stop at the next section header (=== ... ===)
+                if re.match(r'^={3,}\s+.+\s+={3,}$', line.strip()):
+                    break
+                fail_sections.append(line)
+    
+    # Pattern 2: pytest's short test summary
+    if not fail_sections and '= short test summary info =' in stdout:
+        lines = stdout.split('\n')
+        in_summary = False
+        for line in lines:
+            if '= short test summary info =' in line:
+                in_summary = True
+                continue
+            if in_summary:
+                if re.match(r'^={3,}\s+.+\s+={3,}$', line.strip()):
+                    break
+                fail_sections.append(line)
+    
+    # Pattern 3: Look for FAILED lines with assertion info
+    if not fail_sections:
+        lines = stdout.split('\n')
+        for i, line in enumerate(lines):
+            if 'FAILED' in line or 'AssertionError' in line or 'Error' in line:
+                # Grab context: a few lines before and after
+                start = max(0, i - 5)
+                end = min(len(lines), i + 10)
+                fail_sections = lines[start:end]
+                break
+    
+    if fail_sections:
+        failure_text = '\n'.join(fail_sections).strip()
+        # Add stderr if it has useful content (filter out common noise)
+        stderr_useful = _filter_stderr(stderr)
+        if stderr_useful:
+            failure_text += f"\n\n--- STDERR ---\n{stderr_useful}"
+        return failure_text
+    
+    # Fallback: truncated raw output
+    stdout_tail = stdout[-4000:] if len(stdout) > 4000 else stdout
+    stderr_tail = _filter_stderr(stderr)
+    parts = []
+    if stdout_tail.strip():
+        parts.append(f"--- STDOUT ---\n{stdout_tail}")
+    if stderr_tail:
+        parts.append(f"--- STDERR ---\n{stderr_tail}")
+    return '\n\n'.join(parts) if parts else "(no output captured)"
+
+
+def _filter_stderr(stderr: str) -> str:
+    """Filter stderr to remove common noisy lines, keep useful content."""
+    if not stderr or not stderr.strip():
+        return ""
+    
+    # Lines to filter out (common pytest/torch noise)
+    noise_patterns = [
+        'UserWarning:',
+        'warnings.warn(',
+        'FutureWarning:',
+        'DeprecationWarning:',
+        'from .compat import',
+        'PytestUnraisableExceptionWarning',
+    ]
+    
+    lines = stderr.split('\n')
+    filtered = []
+    for line in lines:
+        if any(pattern in line for pattern in noise_patterns):
+            continue
+        if line.strip():
+            filtered.append(line)
+    
+    result = '\n'.join(filtered).strip()
+    # Truncate if still too long
+    if len(result) > 2000:
+        result = result[-2000:]
+    return result
+
+
 def slice_tests_to_workers(items: List, num_workers: int) -> List[List]:
     """
     Distribute tests across workers using round-robin for balance.
@@ -558,7 +656,7 @@ class DynamicWorkerPool:
                 )
                 
                 duration = time.time() - start_time
-                outcome, skip_reason = self._parse_junit_result(junit_path)
+                outcome, skip_reason, fail_message = self._parse_junit_result(junit_path)
                 
                 if result.returncode == 0:
                     if outcome == 'skipped':
@@ -594,8 +692,8 @@ class DynamicWorkerPool:
                         f"{'='*70}\n"
                         f"\nThis test caused Python to crash with {signal_name}.\n"
                         f"pytest-fkit caught it and converted it to an ERROR.\n"
-                        f"\n--- STDOUT ---\n{result.stdout}\n"
-                        f"\n--- STDERR ---\n{result.stderr}\n"
+                        f"\n--- STDOUT ---\n{result.stdout[-4000:] if len(result.stdout) > 4000 else result.stdout}\n"
+                        f"\n--- STDERR ---\n{result.stderr[-4000:] if len(result.stderr) > 4000 else result.stderr}\n"
                         f"{'='*70}\n"
                     )
                     
@@ -609,8 +707,12 @@ class DynamicWorkerPool:
                     )
                 
                 else:
-                    # Normal failure
-                    fail_info = f"\n--- STDOUT ---\n{result.stdout}\n\n--- STDERR ---\n{result.stderr}"
+                    # Normal failure - prefer structured JUnit failure message
+                    if fail_message:
+                        fail_info = fail_message
+                    else:
+                        # Fallback: extract failure info from subprocess output
+                        fail_info = _extract_failure_from_output(result.stdout, result.stderr)
                     return TestResult(
                         nodeid=nodeid,
                         outcome='failed',
@@ -649,12 +751,16 @@ class DynamicWorkerPool:
                 pass
     
     def _parse_junit_result(self, junit_path: str) -> tuple:
-        """Parse JUnit XML for outcome and skip reason."""
+        """Parse JUnit XML for outcome, skip reason, and failure message.
+        
+        Returns:
+            (outcome, skip_reason, failure_message) tuple
+        """
         import xml.etree.ElementTree as ET
         
         try:
             if not os.path.exists(junit_path):
-                return 'unknown', None
+                return 'unknown', None, None
             
             tree = ET.parse(junit_path)
             root = tree.getroot()
@@ -663,16 +769,25 @@ class DynamicWorkerPool:
                 skipped = testcase.find('skipped')
                 if skipped is not None:
                     reason = skipped.get('message') or skipped.text or "Skipped"
-                    return 'skipped', reason
+                    return 'skipped', reason, None
                 
-                if testcase.find('failure') is not None or testcase.find('error') is not None:
-                    return 'failed', None
+                failure = testcase.find('failure')
+                if failure is not None:
+                    fail_msg = failure.get('message', '')
+                    fail_text = failure.text or ''
+                    return 'failed', None, f"{fail_msg}\n{fail_text}".strip()
                 
-                return 'passed', None
+                error = testcase.find('error')
+                if error is not None:
+                    err_msg = error.get('message', '')
+                    err_text = error.text or ''
+                    return 'failed', None, f"{err_msg}\n{err_text}".strip()
+                
+                return 'passed', None, None
             
-            return 'unknown', None
+            return 'unknown', None, None
         except Exception:
-            return 'unknown', None
+            return 'unknown', None, None
     
     def submit_tests(self, items: List):
         """Submit tests to the work queue."""
@@ -968,7 +1083,7 @@ class SlicedWorkerPool:
                 )
                 
                 duration = time.time() - start_time
-                outcome, skip_reason = self._parse_junit_result(junit_path)
+                outcome, skip_reason, fail_message = self._parse_junit_result(junit_path)
                 
                 if result.returncode == 0:
                     if outcome == 'skipped':
@@ -1004,8 +1119,8 @@ class SlicedWorkerPool:
                         f"{'='*70}\n"
                         f"\nThis test caused Python to crash with {signal_name}.\n"
                         f"pytest-fkit caught it and converted it to an ERROR.\n"
-                        f"\n--- STDOUT ---\n{result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout}\n"
-                        f"\n--- STDERR ---\n{result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr}\n"
+                        f"\n--- STDOUT ---\n{result.stdout[-4000:] if len(result.stdout) > 4000 else result.stdout}\n"
+                        f"\n--- STDERR ---\n{result.stderr[-4000:] if len(result.stderr) > 4000 else result.stderr}\n"
                         f"{'='*70}\n"
                     )
                     
@@ -1019,8 +1134,12 @@ class SlicedWorkerPool:
                     )
                 
                 else:
-                    # Normal failure
-                    fail_info = f"\n--- STDOUT ---\n{result.stdout[-2000:] if len(result.stdout) > 2000 else result.stdout}\n\n--- STDERR ---\n{result.stderr[-2000:] if len(result.stderr) > 2000 else result.stderr}"
+                    # Normal failure - prefer structured JUnit failure message
+                    if fail_message:
+                        fail_info = fail_message
+                    else:
+                        # Fallback: extract failure info from subprocess output
+                        fail_info = _extract_failure_from_output(result.stdout, result.stderr)
                     return TestResult(
                         nodeid=nodeid,
                         outcome='failed',
@@ -1058,11 +1177,15 @@ class SlicedWorkerPool:
             except:
                 pass
     
-    def _parse_junit_result(self, junit_path: str) -> Tuple[str, Optional[str]]:
-        """Parse JUnit XML for outcome and skip reason."""
+    def _parse_junit_result(self, junit_path: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Parse JUnit XML for outcome, skip reason, and failure message.
+        
+        Returns:
+            (outcome, skip_reason, failure_message) tuple
+        """
         try:
             if not os.path.exists(junit_path):
-                return 'unknown', None
+                return 'unknown', None, None
             
             tree = ET.parse(junit_path)
             root = tree.getroot()
@@ -1071,16 +1194,25 @@ class SlicedWorkerPool:
                 skipped = testcase.find('skipped')
                 if skipped is not None:
                     reason = skipped.get('message') or skipped.text or "Skipped"
-                    return 'skipped', reason
+                    return 'skipped', reason, None
                 
-                if testcase.find('failure') is not None or testcase.find('error') is not None:
-                    return 'failed', None
+                failure = testcase.find('failure')
+                if failure is not None:
+                    fail_msg = failure.get('message', '')
+                    fail_text = failure.text or ''
+                    return 'failed', None, f"{fail_msg}\n{fail_text}".strip()
                 
-                return 'passed', None
+                error = testcase.find('error')
+                if error is not None:
+                    err_msg = error.get('message', '')
+                    err_text = error.text or ''
+                    return 'failed', None, f"{err_msg}\n{err_text}".strip()
+                
+                return 'passed', None, None
             
-            return 'unknown', None
+            return 'unknown', None, None
         except Exception:
-            return 'unknown', None
+            return 'unknown', None, None
     
     def submit_tests(self, items: List):
         """Slice and distribute tests to workers."""
@@ -1274,8 +1406,16 @@ class CrashIsolationPlugin:
         if stats['timeouts'] > 0:
             print(f"   ⏱️  Timeouts: {stats['timeouts']}")
         if stats['gpu_errors'] > 0:
-            print(f"   🎮 GPU errors: {stats['gpu_errors']} (retries: {stats['retries']})")
-        if stats['workers_failed'] > 0:
+            retries = stats.get('retries', 0)
+            redistributed = stats.get('redistributed', 0)
+            extra_parts = []
+            if retries:
+                extra_parts.append(f"retries: {retries}")
+            if redistributed:
+                extra_parts.append(f"redistributed: {redistributed}")
+            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
+            print(f"   🎮 GPU errors: {stats['gpu_errors']}{extra}")
+        if stats.get('workers_failed', 0) > 0:
             print(f"   ⚠️  Workers disabled: {stats['workers_failed']}")
         print(f"{'='*70}")
         
