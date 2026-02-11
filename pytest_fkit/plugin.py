@@ -88,6 +88,13 @@ def pytest_addoption(parser):
         default=False,
         help="[DEPRECATED] Use batch mode (now default). Use --fkit-mode=isolate for per-test isolation.",
     )
+    group.addoption(
+        "--fkit-max-retries",
+        action="store",
+        type=int,
+        default=3,
+        help="Max retries for transient errors (GPU unavailable, DNS, network). Default: 3",
+    )
 
 
 def pytest_configure(config):
@@ -286,7 +293,76 @@ class WorkItem:
     nodeid: str
     item: object  # pytest item
     retry_count: int = 0
-    max_retries: int = 1  # Allow 1 retry on GPU errors
+    max_retries: int = 3  # Allow retries on transient errors (GPU unavailable, DNS, network)
+
+
+# ---------------------------------------------------------------------------
+# Transient error detection for retry logic
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate a transient/retryable error (not a real test failure)
+TRANSIENT_ERROR_PATTERNS = [
+    # GPU availability (transient when running across workers with shared GPUs)
+    'No HIP GPUs are available',
+    'No CUDA GPUs are available',
+    'RuntimeError: No HIP GPUs',
+    'RuntimeError: No CUDA GPUs',
+    'hipErrorNoDevice',
+    'cudaErrorNoDevice',
+    # Network / DNS (transient infrastructure issues)
+    'Temporary failure in name resolution',
+    'Name or service not known',
+    'ConnectError',
+    'ConnectionError',
+    'Connection refused',
+    'Connection reset by peer',
+    'Connection timed out',
+    'OSError: [Errno -3]',  # DNS resolution failure
+    'OSError: [Errno -2]',  # DNS resolution failure
+    'OSError: [Errno 101]',  # Network unreachable
+    'OSError: [Errno 110]',  # Connection timed out
+    'OSError: [Errno 111]',  # Connection refused
+    # HuggingFace Hub transient errors
+    'requests.exceptions.ConnectionError',
+    'httpx.ConnectError',
+    'httpx.ReadTimeout',
+    'huggingface_hub.errors.HfHubHTTPError',
+    'HTTP Error 5',  # 500, 502, 503, 504
+    'Server Error',
+    '502 Bad Gateway',
+    '503 Service Unavailable',
+    '504 Gateway Timeout',
+    # NCCL transient errors (often recoverable on retry with different worker)
+    'NCCL Error 2: unhandled system error',
+    'NCCL error',
+    # GPU memory (may succeed on a different worker or after GC)
+    'CUDA out of memory',
+    'hipErrorOutOfMemory',
+    'HIP out of memory',
+]
+
+
+def _is_transient_error(result_or_text, stderr: str = "") -> bool:
+    """Detect if a failure was due to a transient/retryable issue.
+    
+    This catches GPU availability, DNS resolution, network connectivity,
+    HuggingFace Hub errors, and NCCL errors that may succeed on retry
+    (especially when retried on a different worker with different GPUs).
+    
+    Args:
+        result_or_text: Either a TestResult object or a string to check
+        stderr: Additional stderr text to check
+    
+    Returns:
+        True if the error appears transient and the test should be retried
+    """
+    if isinstance(result_or_text, TestResult):
+        check_text = (result_or_text.longrepr or "") + stderr
+    else:
+        check_text = str(result_or_text) + stderr
+    
+    check_lower = check_text.lower()
+    return any(pattern.lower() in check_lower for pattern in TRANSIENT_ERROR_PATTERNS)
 
 
 def _extract_failure_from_output(stdout: str, stderr: str) -> str:
@@ -425,19 +501,20 @@ class DynamicWorkerPool:
     Tests are not pre-assigned to workers. Instead:
     1. All tests go into a shared queue
     2. Workers pull tests from the queue as they become available
-    3. If a worker encounters a GPU error, the test can be retried on another worker
+    3. If a worker encounters a transient error (GPU, DNS, network), the test is retried
     4. Failed workers are marked and work continues with remaining workers
     """
     
     def __init__(self, num_workers: int, gpu_allocations: List[str], 
                  gpu_vendor: str, timeout: int, result_callback: Callable,
-                 threads_per_worker: int = 4):
+                 threads_per_worker: int = 4, max_retries: int = 3):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
         self.timeout = timeout
         self.result_callback = result_callback
         self.threads_per_worker = threads_per_worker
+        self._max_retries = max_retries
         
         # Work queue - tests waiting to be executed
         self.work_queue = queue.Queue()
@@ -501,24 +578,7 @@ class DynamicWorkerPool:
     
     def _is_gpu_error(self, result: TestResult, stderr: str = "") -> bool:
         """Detect if a failure was due to GPU issues."""
-        gpu_error_patterns = [
-            'CUDA out of memory',
-            'CUDA error',
-            'HIP error',
-            'ROCm error',
-            'GPU memory',
-            'hipErrorNoBinaryForGpu',
-            'hipErrorOutOfMemory',
-            'NCCL error',
-            'device-side assert',
-            'no GPU',
-            'GPU not found',
-            'cudaErrorNoDevice',
-            'hipErrorNoDevice',
-        ]
-        
-        check_text = (result.longrepr or "") + stderr
-        return any(pattern.lower() in check_text.lower() for pattern in gpu_error_patterns)
+        return _is_transient_error(result, stderr)
     
     def _worker_loop(self, worker_id: int):
         """Main loop for a worker thread."""
@@ -547,8 +607,9 @@ class DynamicWorkerPool:
                 # Run the test
                 result = self._run_test(work_item.nodeid, worker_id, gpu_env)
                 
-                # Check for GPU errors
-                if result.outcome == 'failed' and self._is_gpu_error(result):
+                # Check for transient errors (GPU, DNS, network, NCCL)
+                is_transient = result.outcome == 'failed' and _is_transient_error(result)
+                if is_transient:
                     result.gpu_error = True
                     
                     with self._lock:
@@ -568,7 +629,7 @@ class DynamicWorkerPool:
                         with self._lock:
                             self._stats['retries'] += 1
                         print(f"   🔄 Retrying {work_item.nodeid} on another worker "
-                              f"(attempt {work_item.retry_count + 1})")
+                              f"(attempt {work_item.retry_count + 1}/{work_item.max_retries})")
                         self.work_queue.put(work_item)
                         self.work_queue.task_done()
                         continue
@@ -792,7 +853,8 @@ class DynamicWorkerPool:
     def submit_tests(self, items: List):
         """Submit tests to the work queue."""
         for item in items:
-            work_item = WorkItem(nodeid=item.nodeid, item=item)
+            work_item = WorkItem(nodeid=item.nodeid, item=item,
+                                 max_retries=self._max_retries)
             self.work_queue.put(work_item)
         self._all_submitted.set()
     
@@ -862,13 +924,14 @@ class SlicedWorkerPool:
     
     def __init__(self, num_workers: int, gpu_allocations: List[str], 
                  gpu_vendor: str, timeout: int, result_callback: Callable,
-                 threads_per_worker: int = 4):
+                 threads_per_worker: int = 4, max_retries: int = 3):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
         self.timeout = timeout
         self.result_callback = result_callback
         self.threads_per_worker = threads_per_worker
+        self._max_retries = max_retries
         
         # Pre-sliced test lists for each worker
         self._worker_slices: List[List] = []
@@ -891,6 +954,7 @@ class SlicedWorkerPool:
             'crashes': 0,
             'timeouts': 0,
             'gpu_errors': 0,
+            'retries': 0,
             'redistributed': 0,
             'workers_failed': 0,
         }
@@ -935,19 +999,18 @@ class SlicedWorkerPool:
         return env_vars
     
     def _is_gpu_error(self, result: TestResult, stderr: str = "") -> bool:
-        """Detect if a failure was due to GPU issues."""
-        gpu_error_patterns = [
-            'CUDA out of memory', 'CUDA error', 'HIP error', 'ROCm error',
-            'GPU memory', 'hipErrorNoBinaryForGpu', 'hipErrorOutOfMemory',
-            'NCCL error', 'device-side assert', 'no GPU', 'GPU not found',
-            'cudaErrorNoDevice', 'hipErrorNoDevice', 'hipErrorInvalidDevice',
-            'RuntimeError: No HIP GPUs', 'RuntimeError: No CUDA GPUs',
-        ]
-        check_text = (result.longrepr or "") + stderr
-        return any(pattern.lower() in check_text.lower() for pattern in gpu_error_patterns)
+        """Detect if a failure was due to GPU or transient issues."""
+        return _is_transient_error(result, stderr)
     
     def _worker_loop(self, worker_id: int, test_slice: List):
-        """Main loop for a worker - runs its pre-assigned slice with GPU failover."""
+        """Main loop for a worker - runs its pre-assigned slice with GPU failover.
+        
+        Enhanced with per-test retry for transient errors (GPU unavailable,
+        DNS resolution, network failures, NCCL errors). A test is retried
+        up to max_retries times on the SAME worker before being counted as
+        a real failure. After max_gpu_errors consecutive transient failures,
+        remaining tests are redistributed to healthy workers.
+        """
         gpu_env = self._get_gpu_env_vars(worker_id)
         gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
         
@@ -971,22 +1034,36 @@ class SlicedWorkerPool:
                     self._stats['redistributed'] += len(remaining)
                     self._stats['workers_failed'] += 1
                     self._worker_states[worker_id] = WorkerState.FAILED
-                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): GPU errors detected, "
+                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): transient errors detected, "
                       f"redistributing {len(remaining)} remaining tests")
                 for remaining_item in remaining:
                     self._overflow_queue.put(remaining_item)
                 return
             
-            # Run the test in subprocess (crash isolation)
+            # Run the test with retry logic for transient errors
+            max_retries = getattr(self, '_max_retries', 3)
             result = self._run_test(item.nodeid, worker_id, gpu_env)
+            retry_count = 0
             
-            # Check for GPU errors
-            if result.outcome == 'failed' and self._is_gpu_error(result):
+            while (result.outcome == 'failed' 
+                   and _is_transient_error(result)
+                   and retry_count < max_retries):
+                retry_count += 1
+                with self._lock:
+                    self._stats['retries'] = self._stats.get('retries', 0) + 1
+                print(f"   🔄 Worker {worker_id}: Retrying {item.nodeid} "
+                      f"(attempt {retry_count + 1}/{max_retries + 1}, transient error)")
+                # Brief pause before retry (exponential backoff: 1s, 2s, 4s)
+                time.sleep(min(2 ** (retry_count - 1), 4))
+                result = self._run_test(item.nodeid, worker_id, gpu_env)
+            
+            # Check if the final result is still a transient error
+            if result.outcome == 'failed' and _is_transient_error(result):
                 consecutive_gpu_errors += 1
                 with self._lock:
                     self._stats['gpu_errors'] += 1
             else:
-                consecutive_gpu_errors = 0  # Reset on success
+                consecutive_gpu_errors = 0  # Reset on success or non-transient failure
             
             # Update stats
             with self._lock:
@@ -1012,7 +1089,10 @@ class SlicedWorkerPool:
         self._process_overflow(worker_id, gpu_env)
     
     def _process_overflow(self, worker_id: int, gpu_env: Dict[str, str]):
-        """Process tests from overflow queue (from failed workers)."""
+        """Process tests from overflow queue (from failed workers).
+        
+        Redistributed tests also get retry logic for transient errors.
+        """
         gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
         
         while not self._shutdown.is_set():
@@ -1023,6 +1103,19 @@ class SlicedWorkerPool:
             
             print(f"   Worker {worker_id} (GPUs: {gpu_str}): picking up redistributed test")
             result = self._run_test(item.nodeid, worker_id, gpu_env)
+            
+            # Retry transient errors on this (healthy) worker
+            retry_count = 0
+            while (result.outcome == 'failed'
+                   and _is_transient_error(result)
+                   and retry_count < self._max_retries):
+                retry_count += 1
+                with self._lock:
+                    self._stats['retries'] += 1
+                print(f"   🔄 Worker {worker_id}: Retrying redistributed {item.nodeid} "
+                      f"(attempt {retry_count + 1}/{self._max_retries + 1})")
+                time.sleep(min(2 ** (retry_count - 1), 4))
+                result = self._run_test(item.nodeid, worker_id, gpu_env)
             
             with self._lock:
                 self._stats['tests_run'] += 1
@@ -1265,6 +1358,7 @@ class CrashIsolationPlugin:
         self.timeout = config.getoption("--fkit-timeout")
         self.gpus_per_worker = config.getoption("--fkit-gpus-per-worker")
         self.execution_mode = config.getoption("--fkit-mode")
+        self.max_retries = config.getoption("--fkit-max-retries")
         threads_per_worker_opt = config.getoption("--fkit-threads-per-worker")
         
         # Parse worker count
@@ -1325,11 +1419,13 @@ class CrashIsolationPlugin:
             print(f"   GPU allocations: {self.gpu_allocations}")
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
+            print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
         else:
             print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
                   f"{self.threads_per_worker} CPU threads/worker (no GPU detected)")
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
+            print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
     
     def _result_callback(self, item, result: TestResult):
         """Callback for when a test completes."""
@@ -1365,7 +1461,8 @@ class CrashIsolationPlugin:
                 gpu_vendor=self.gpu_info.vendor,
                 timeout=self.timeout,
                 result_callback=self._result_callback,
-                threads_per_worker=self.threads_per_worker
+                threads_per_worker=self.threads_per_worker,
+                max_retries=self.max_retries,
             )
         else:
             # Dynamic mode: tests are assigned to workers on-demand
@@ -1378,7 +1475,8 @@ class CrashIsolationPlugin:
                 gpu_vendor=self.gpu_info.vendor,
                 timeout=self.timeout,
                 result_callback=self._result_callback,
-                threads_per_worker=self.threads_per_worker
+                threads_per_worker=self.threads_per_worker,
+                max_retries=self.max_retries,
             )
         
         # Submit all tests (sliced or queued depending on pool type)
@@ -1480,12 +1578,24 @@ class CrashIsolationPlugin:
                 gpu_allocations=self.gpu_allocations,
                 gpu_vendor=self.gpu_info.vendor,
                 timeout=self.timeout,
-                result_callback=lambda i, r: None  # No-op callback
+                result_callback=lambda i, r: None,  # No-op callback
+                max_retries=self.max_retries,
             )
         
-        # Run test directly
-        result = self.worker_pool._run_test(item.nodeid, worker_id=0, 
-                                            gpu_env=self.worker_pool._get_gpu_env_vars(0))
+        # Run test with retry logic for transient errors
+        gpu_env = self.worker_pool._get_gpu_env_vars(0)
+        result = self.worker_pool._run_test(item.nodeid, worker_id=0, gpu_env=gpu_env)
+        
+        retry_count = 0
+        while (result.outcome == 'failed'
+               and _is_transient_error(result)
+               and retry_count < self.max_retries):
+            retry_count += 1
+            print(f"   🔄 Retrying {item.nodeid} "
+                  f"(attempt {retry_count + 1}/{self.max_retries + 1}, transient error)")
+            time.sleep(min(2 ** (retry_count - 1), 4))
+            result = self.worker_pool._run_test(item.nodeid, worker_id=0, gpu_env=gpu_env)
+        
         self._report_result(item, result)
         
         return True

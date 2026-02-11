@@ -1,6 +1,6 @@
 Metadata-Version: 2.4
 Name: pytest-fkit
-Version: 0.3.1
+Version: 0.3.2
 Summary: A pytest plugin that prevents crashes from killing your test suite, with execution tracing
 Author: Cemberk
 License: MIT

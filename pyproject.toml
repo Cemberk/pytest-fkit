@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-fkit"
-version = "0.3.1"
+version = "0.3.2"
 description = "A pytest plugin that prevents crashes from killing your test suite, with execution tracing"
 readme = "README.md"
 requires-python = ">=3.8"
