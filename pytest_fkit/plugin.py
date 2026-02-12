@@ -575,7 +575,21 @@ class DynamicWorkerPool:
         self._workers = []
     
     def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
-        """Get GPU and CPU environment variables for a worker."""
+        """Get GPU and CPU environment variables for a worker.
+
+        AMD/ROCm GPU visibility layering:
+          ROCR_VISIBLE_DEVICES  – physical GPU indices (ROCm runtime level).
+          HIP_VISIBLE_DEVICES   – indices *relative to* the ROCR-visible set.
+          CUDA_VISIBLE_DEVICES  – PyTorch ROCm maps this to HIP_VISIBLE_DEVICES.
+
+        If a worker owns physical GPU 3, we set:
+          ROCR_VISIBLE_DEVICES=3   (expose only that physical GPU)
+          HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
+          CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
+
+        Setting all three to "3" would fail because HIP would look for
+        ROCR-index 3 inside a set that only has ROCR-index 0.
+        """
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
         
         env_vars = {
@@ -592,9 +606,13 @@ class DynamicWorkerPool:
         
         if gpu_ids:
             if self.gpu_vendor == 'amd':
-                env_vars['HIP_VISIBLE_DEVICES'] = gpu_ids
+                # ROCR uses the physical device indices for /dev/kfd + /dev/dri isolation
                 env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
-                env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
+                # HIP and CUDA indices are 0-based *within* the ROCR-visible set
+                num_gpus = len(gpu_ids.split(','))
+                hip_ids = ','.join(str(i) for i in range(num_gpus))
+                env_vars['HIP_VISIBLE_DEVICES'] = hip_ids
+                env_vars['CUDA_VISIBLE_DEVICES'] = hip_ids
             elif self.gpu_vendor == 'nvidia':
                 env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
             env_vars['FKIT_WORKER_ID'] = str(worker_id)
@@ -1007,7 +1025,21 @@ class SlicedWorkerPool:
         self._item_map = {}
     
     def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
-        """Get GPU and CPU environment variables for a worker."""
+        """Get GPU and CPU environment variables for a worker.
+
+        AMD/ROCm GPU visibility layering:
+          ROCR_VISIBLE_DEVICES  – physical GPU indices (ROCm runtime level).
+          HIP_VISIBLE_DEVICES   – indices *relative to* the ROCR-visible set.
+          CUDA_VISIBLE_DEVICES  – PyTorch ROCm maps this to HIP_VISIBLE_DEVICES.
+
+        If a worker owns physical GPU 3, we set:
+          ROCR_VISIBLE_DEVICES=3   (expose only that physical GPU)
+          HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
+          CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
+
+        Setting all three to "3" would fail because HIP would look for
+        ROCR-index 3 inside a set that only has ROCR-index 0.
+        """
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
         
         env_vars = {
@@ -1026,11 +1058,16 @@ class SlicedWorkerPool:
         
         if gpu_ids:
             if self.gpu_vendor == 'amd':
-                env_vars['HIP_VISIBLE_DEVICES'] = gpu_ids
+                # ROCR uses the physical device indices for /dev/kfd + /dev/dri isolation
                 env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
-                env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
+                # HIP and CUDA indices are 0-based *within* the ROCR-visible set
+                num_gpus = len(gpu_ids.split(','))
+                hip_ids = ','.join(str(i) for i in range(num_gpus))
+                env_vars['HIP_VISIBLE_DEVICES'] = hip_ids
+                env_vars['CUDA_VISIBLE_DEVICES'] = hip_ids
             elif self.gpu_vendor == 'nvidia':
                 env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
+            env_vars['FKIT_WORKER_ID'] = str(worker_id)
             env_vars['FKIT_GPU_IDS'] = gpu_ids
         
         return env_vars
@@ -1475,10 +1512,19 @@ class CrashIsolationPlugin:
                   f"{self.gpu_info.count} {self.gpu_info.vendor.upper()} GPUs, "
                   f"{self.gpus_per_worker} GPU(s)/worker, "
                   f"{self.threads_per_worker} CPU threads/worker")
-            print(f"   GPU allocations: {self.gpu_allocations}")
+            print(f"   GPU allocations (physical): {self.gpu_allocations}")
+            if self.gpu_info.vendor == 'amd':
+                for w, phys in enumerate(self.gpu_allocations):
+                    n = len(phys.split(','))
+                    hip = ','.join(str(i) for i in range(n))
+                    print(f"   Worker {w}: ROCR_VISIBLE_DEVICES={phys} "
+                          f"HIP_VISIBLE_DEVICES={hip} "
+                          f"(/dev/kfd + /dev/dri)")
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
+            # GPU preflight: verify each worker can see its GPU from a subprocess
+            self._gpu_preflight()
         else:
             print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
                   f"{self.threads_per_worker} CPU threads/worker (no GPU detected)")
@@ -1486,6 +1532,67 @@ class CrashIsolationPlugin:
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
     
+    def _gpu_preflight(self):
+        """Verify each worker can see its GPU from a subprocess.
+
+        Spawns a tiny Python process per worker with the exact same env that
+        _run_test would use.  Checks /dev/kfd, /dev/dri/renderD*, and
+        torch.cuda.is_available().  Failures here surface the root cause
+        immediately instead of manifesting as hundreds of mysterious skips.
+        """
+        probe_script = (
+            "import os, sys, glob\n"
+            "kfd = os.path.exists('/dev/kfd')\n"
+            "drm = sorted(glob.glob('/dev/dri/renderD*'))\n"
+            "hip = os.environ.get('HIP_VISIBLE_DEVICES', '')\n"
+            "rocr = os.environ.get('ROCR_VISIBLE_DEVICES', '')\n"
+            "cuda = os.environ.get('CUDA_VISIBLE_DEVICES', '')\n"
+            "try:\n"
+            "    import torch\n"
+            "    avail = torch.cuda.is_available()\n"
+            "    cnt = torch.cuda.device_count() if avail else 0\n"
+            "except Exception as e:\n"
+            "    avail = False; cnt = 0\n"
+            "print(f'kfd={kfd} drm={len(drm)} avail={avail} cnt={cnt} '"
+            "      f'ROCR={rocr} HIP={hip} CUDA={cuda}')\n"
+            "sys.exit(0 if avail else 1)\n"
+        )
+        all_ok = True
+        for w in range(min(self.num_workers, len(self.gpu_allocations))):
+            env = os.environ.copy()
+            gpu_env = self.gpu_allocations[w]
+            if not gpu_env:
+                continue
+            # Build env exactly like _run_test would
+            if self.gpu_info.vendor == 'amd':
+                num = len(gpu_env.split(','))
+                hip_ids = ','.join(str(i) for i in range(num))
+                env['ROCR_VISIBLE_DEVICES'] = gpu_env
+                env['HIP_VISIBLE_DEVICES'] = hip_ids
+                env['CUDA_VISIBLE_DEVICES'] = hip_ids
+            elif self.gpu_info.vendor == 'nvidia':
+                env['CUDA_VISIBLE_DEVICES'] = gpu_env
+            try:
+                r = subprocess.run(
+                    [sys.executable, '-c', probe_script],
+                    capture_output=True, text=True, timeout=30, env=env
+                )
+                line = (r.stdout.strip().split('\n') or [''])[-1]
+                if r.returncode != 0:
+                    all_ok = False
+                    print(f"   ⚠️  Worker {w} GPU PREFLIGHT FAILED: {line}")
+                    if r.stderr.strip():
+                        for s in r.stderr.strip().split('\n')[-3:]:
+                            print(f"       {s}")
+                else:
+                    print(f"   ✓  Worker {w} GPU OK: {line}")
+            except Exception as e:
+                all_ok = False
+                print(f"   ⚠️  Worker {w} GPU preflight error: {e}")
+        if not all_ok:
+            print("   ⚠️  Some workers cannot see their GPU – tests may skip "
+                  "with 'test requires accelerator'")
+
     def _result_callback(self, item, result: TestResult):
         """Callback for when a test completes."""
         with self._results_lock:

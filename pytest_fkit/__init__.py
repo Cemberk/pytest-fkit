@@ -2,4 +2,4 @@
 pytest-fkit: A pytest plugin that prevents crashes from killing your test suite
 """
 
-__version__ = "0.3.2"
+__version__ = "0.3.4"
