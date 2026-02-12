@@ -30,6 +30,7 @@ import threading
 import queue
 import re
 import json
+import shutil
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -168,7 +169,30 @@ def detect_cpus() -> CPUInfo:
 
 
 def detect_gpus() -> GPUInfo:
-    """Detect available GPUs (AMD or NVIDIA)."""
+    """Detect available GPUs (AMD or NVIDIA).
+
+    IMPORTANT: Respects HIP_VISIBLE_DEVICES / CUDA_VISIBLE_DEVICES /
+    ROCR_VISIBLE_DEVICES environment variables.  These env vars restrict
+    which GPUs the parent process intended to make available (e.g. set by
+    priority_bucketing.py or Jenkins).  rocm-smi and nvidia-smi report ALL
+    physical GPUs regardless of these env vars, so we must check the env
+    vars first to avoid allocating workers to inaccessible GPUs.
+    """
+    # ---- Step 1: Respect visibility env vars ----
+    # Check AMD-specific vars first, then the generic CUDA var.
+    for var in ('HIP_VISIBLE_DEVICES', 'ROCR_VISIBLE_DEVICES', 'CUDA_VISIBLE_DEVICES'):
+        val = os.environ.get(var, '').strip()
+        if val:
+            gpu_ids = [x.strip() for x in val.split(',') if x.strip()]
+            if gpu_ids:
+                # Determine vendor from available CLI tools
+                vendor = 'amd' if shutil.which('rocm-smi') else (
+                    'nvidia' if shutil.which('nvidia-smi') else 'unknown')
+                print(f"[fkit] GPU detection: using {var}={val} "
+                      f"({len(gpu_ids)} GPUs, vendor={vendor})")
+                return GPUInfo(count=len(gpu_ids), vendor=vendor, ids=gpu_ids)
+
+    # ---- Step 2: Fall back to hardware detection ----
     # Try AMD first (ROCm)
     try:
         result = subprocess.run(
@@ -205,6 +229,7 @@ def detect_gpus() -> GPUInfo:
                         gpu_ids = [str(i) for i in range(gpu_count)]
             
             if gpu_ids:
+                print(f"[fkit] GPU detection: rocm-smi found {len(gpu_ids)} GPUs")
                 return GPUInfo(count=len(gpu_ids), vendor='amd', ids=gpu_ids)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -225,6 +250,7 @@ def detect_gpus() -> GPUInfo:
                     if match:
                         gpu_ids.append(match.group(1))
             if gpu_ids:
+                print(f"[fkit] GPU detection: nvidia-smi found {len(gpu_ids)} GPUs")
                 return GPUInfo(count=len(gpu_ids), vendor='nvidia', ids=gpu_ids)
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
@@ -638,6 +664,12 @@ class DynamicWorkerPool:
                     with self._lock:
                         self._worker_error_counts[worker_id] = 0
                 
+                # GPU cooldown after crash signals (SIGABRT, SIGSEGV, etc.)
+                if result.crash:
+                    print(f"   ⏳ Worker {worker_id}: GPU cooldown after crash "
+                          f"(3s for driver recovery)")
+                    time.sleep(3)
+                
                 # Update stats
                 with self._lock:
                     self._stats['tests_run'] += 1
@@ -685,6 +717,11 @@ class DynamicWorkerPool:
             # Prepare environment
             env = os.environ.copy()
             env.update(gpu_env)
+            
+            # NCCL error recovery: enable async error handling so NCCL
+            # can recover from transient communication failures instead
+            # of hanging or crashing the entire process group.
+            env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
             
             # Preserve critical variables
             critical_vars = ['HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
@@ -1021,20 +1058,26 @@ class SlicedWorkerPool:
             self._worker_states[worker_id] = WorkerState.RUNNING
         
         consecutive_gpu_errors = 0
+        last_test_crashed = False  # Track crash state for accelerated redistribution
         
         for idx, item in enumerate(test_slice):
             if self._shutdown.is_set():
                 break
             
+            # After a crash, lower the redistribution threshold: if the NEXT
+            # test also hits a transient GPU error, the GPU is likely stuck.
+            effective_max_errors = 1 if last_test_crashed else self._max_gpu_errors
+            
             # Check if this worker should stop due to GPU errors
-            if consecutive_gpu_errors >= self._max_gpu_errors:
+            if consecutive_gpu_errors >= effective_max_errors:
                 # Move remaining tests to overflow queue for healthy workers
                 remaining = test_slice[idx:]
                 with self._lock:
                     self._stats['redistributed'] += len(remaining)
                     self._stats['workers_failed'] += 1
                     self._worker_states[worker_id] = WorkerState.FAILED
-                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): transient errors detected, "
+                reason = "post-crash GPU failure" if last_test_crashed else "transient errors"
+                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): {reason} detected, "
                       f"redistributing {len(remaining)} remaining tests")
                 for remaining_item in remaining:
                     self._overflow_queue.put(remaining_item)
@@ -1064,6 +1107,17 @@ class SlicedWorkerPool:
                     self._stats['gpu_errors'] += 1
             else:
                 consecutive_gpu_errors = 0  # Reset on success or non-transient failure
+            
+            # GPU cooldown after crash signals (SIGABRT, SIGSEGV, etc.)
+            # The ROCm/CUDA driver may need time to reclaim resources from
+            # the crashed process before the next subprocess can init the GPU.
+            if result.crash:
+                last_test_crashed = True
+                print(f"   ⏳ Worker {worker_id}: GPU cooldown after crash "
+                      f"(3s for driver recovery)")
+                time.sleep(3)
+            else:
+                last_test_crashed = False
             
             # Update stats
             with self._lock:
@@ -1144,6 +1198,11 @@ class SlicedWorkerPool:
             # Prepare environment
             env = os.environ.copy()
             env.update(gpu_env)
+            
+            # NCCL error recovery: enable async error handling so NCCL
+            # can recover from transient communication failures instead
+            # of hanging or crashing the entire process group.
+            env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
             
             # Preserve critical variables
             critical_vars = ['HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
