@@ -37,6 +37,11 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Callable, Tuple
 from enum import Enum
 
+# Base port for per-worker NCCL MASTER_PORT allocation.
+# Each fkit worker gets NCCL_BASE_PORT + worker_id to avoid collisions
+# when multiple workers run DataParallel tests simultaneously.
+NCCL_BASE_PORT = 29500
+
 
 def pytest_addoption(parser):
     """Add command-line options for pytest-fkit."""
@@ -391,6 +396,62 @@ def _is_transient_error(result_or_text, stderr: str = "") -> bool:
     return any(pattern.lower() in check_lower for pattern in TRANSIENT_ERROR_PATTERNS)
 
 
+def _reset_gpu(gpu_env: Dict[str, str], gpu_vendor: str) -> bool:
+    """Attempt to reset the GPU after a crash.
+
+    After a process crash (SIGABRT/SIGSEGV), the GPU driver may hold stale
+    state from the dead process.  An explicit reset via ``rocm-smi --gpureset``
+    or ``nvidia-smi --gpu-reset`` tells the driver to clean up immediately
+    rather than waiting for a timeout.
+
+    This is best-effort: not all environments allow resets (e.g. VMs,
+    containers without --privileged).  A failed reset doesn't mean the GPU
+    is dead -- the health probe that follows will determine that.
+
+    Returns True if reset command succeeded (or was not needed), False on error.
+    """
+    gpu_ids_str = gpu_env.get('FKIT_GPU_IDS', '')
+    if not gpu_ids_str:
+        return True  # No GPU allocated, nothing to reset
+
+    # Use the *physical* GPU IDs for the reset command
+    # (ROCR_VISIBLE_DEVICES for AMD, CUDA_VISIBLE_DEVICES for NVIDIA)
+    if gpu_vendor == 'amd':
+        physical_ids = gpu_env.get('ROCR_VISIBLE_DEVICES', gpu_ids_str)
+    else:
+        physical_ids = gpu_env.get('CUDA_VISIBLE_DEVICES', gpu_ids_str)
+
+    ok = True
+    for gpu_id in physical_ids.split(','):
+        gpu_id = gpu_id.strip()
+        if not gpu_id:
+            continue
+        try:
+            if gpu_vendor == 'amd':
+                cmd = ['rocm-smi', '--gpureset', '-d', gpu_id]
+            elif gpu_vendor == 'nvidia':
+                cmd = ['nvidia-smi', '--gpu-reset', '-i', gpu_id]
+            else:
+                continue
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                print(f"      GPU reset succeeded for device {gpu_id}")
+            else:
+                # Non-fatal: reset may not be available in this environment
+                print(f"      GPU reset returned {r.returncode} for device {gpu_id} "
+                      f"(may require --privileged or root)")
+                ok = False
+        except FileNotFoundError:
+            pass  # Tool not installed -- skip silently
+        except subprocess.TimeoutExpired:
+            print(f"      GPU reset timed out for device {gpu_id}")
+            ok = False
+        except Exception as e:
+            print(f"      GPU reset error for device {gpu_id}: {e}")
+            ok = False
+    return ok
+
+
 def _extract_failure_from_output(stdout: str, stderr: str) -> str:
     """Extract the meaningful failure message from pytest subprocess output.
     
@@ -489,6 +550,51 @@ def _filter_stderr(stderr: str) -> str:
     return result
 
 
+def _gpu_health_probe(gpu_env: Dict[str, str], timeout: int = 15) -> bool:
+    """Probe GPU health by spawning a subprocess that actually allocates a tensor.
+
+    After a crash (SIGABRT/SIGSEGV), the ROCm/CUDA driver may need time to
+    reclaim the crashed process's GPU context.  ``torch.cuda.is_available()``
+    can return True before the device is actually usable, so we go further and
+    attempt a small tensor allocation + synchronization.
+
+    Returns True if the GPU is healthy, False otherwise.
+    """
+    probe_script = (
+        "import sys\n"
+        "try:\n"
+        "    import torch\n"
+        "    if not torch.cuda.is_available():\n"
+        "        print('probe:unavailable'); sys.exit(1)\n"
+        "    n = torch.cuda.device_count()\n"
+        "    if n == 0:\n"
+        "        print('probe:no_devices'); sys.exit(1)\n"
+        "    # Actually allocate a tensor and sync – this catches driver-level\n"
+        "    # failures that is_available() misses.\n"
+        "    t = torch.zeros(64, device='cuda:0')\n"
+        "    torch.cuda.synchronize()\n"
+        "    del t\n"
+        "    print(f'probe:ok devices={n}')\n"
+        "    sys.exit(0)\n"
+        "except Exception as e:\n"
+        "    print(f'probe:error {e}')\n"
+        "    sys.exit(1)\n"
+    )
+    env = os.environ.copy()
+    env.update(gpu_env)
+    try:
+        r = subprocess.run(
+            [sys.executable, '-c', probe_script],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+        output = (r.stdout.strip().split('\n') or [''])[-1]
+        if r.returncode == 0 and 'probe:ok' in output:
+            return True
+        return False
+    except Exception:
+        return False
+
+
 def slice_tests_to_workers(items: List, num_workers: int) -> List[List]:
     """
     Distribute tests across workers using round-robin for balance.
@@ -520,40 +626,301 @@ def slice_tests_to_workers(items: List, num_workers: int) -> List[List]:
     return slices
 
 
-class DynamicWorkerPool:
+# =========================================================================
+# WorkScheduler — Online-Thr-Restarts scheduling model
+# =========================================================================
+
+class WorkScheduler:
+    """Capacity-aware work scheduler — no drops, no duplicates.
+
+    Correctness invariant
+    ---------------------
+    Every submitted test is in **exactly one** of three states at all times:
+
+        QUEUED      – sitting in the work queue
+        IN_FLIGHT   – checked out by a worker (between get_work / report_result)
+        RESOLVED    – terminal result emitted to pytest (exactly once)
+
+    State transitions::
+
+        submit()        →  QUEUED
+        get_work()      →  QUEUED  ➜  IN_FLIGHT
+        report_result() →  IN_FLIGHT  ➜  RESOLVED   (pass / fail / skip / max-crash)
+                        →  IN_FLIGHT  ➜  QUEUED     (crash, restarts remaining)
+        release_work()  →  IN_FLIGHT  ➜  QUEUED     (worker died before reporting)
+        drain_unresolved() → QUEUED/IN_FLIGHT  ➜  RESOLVED  (all workers dead)
+
+    No test can ever leave the system without reaching RESOLVED.
+    No test can be emitted to pytest more than once (_resolved set guard).
+
+    Crash-restart model
+    -------------------
+    When a test crashes, it is moved back to QUEUED (up to ``max_crashes_per_test``
+    times).  The scheduler tracks which workers crashed which tests so workers
+    can be avoided, but it will still assign to the same worker as a fallback
+    if no other worker is alive.
+
+    When all workers are dead and tests remain, ``drain_unresolved()`` reports
+    them as errors so pytest sees every test exactly once.
     """
-    Pool of workers with dynamic work queue scheduling.
-    
-    Tests are not pre-assigned to workers. Instead:
-    1. All tests go into a shared queue
-    2. Workers pull tests from the queue as they become available
-    3. If a worker encounters a transient error (GPU, DNS, network), the test is retried
-    4. Failed workers are marked and work continues with remaining workers
+
+    def __init__(self, num_workers: int, result_callback: Callable,
+                 max_crashes_per_test: int = 2):
+        self._queue: queue.Queue = queue.Queue()
+        self._lock = threading.Lock()
+        self._result_callback = result_callback
+
+        # --- Capacity tracking ---
+        self._worker_health: Dict[int, str] = {}
+        for i in range(num_workers):
+            self._worker_health[i] = 'healthy'
+
+        # --- Restart bookkeeping ---
+        self._max_crashes = max_crashes_per_test
+        self._crash_counts: Dict[str, int] = {}
+        self._crash_workers: Dict[str, set] = {}
+
+        # --- State tracking (the invariant) ---
+        self._in_flight: Dict[int, object] = {}   # worker_id → item
+        self._resolved: set = set()                # nodeids already emitted
+        self._total_submitted = 0
+        self._total_resolved = 0
+        self._all_submitted = threading.Event()
+        self._all_done = threading.Event()
+        self._shutdown = threading.Event()
+
+        # --- Stats ---
+        self._stats = {
+            'restarts': 0,
+            'permanent_crashes': 0,
+        }
+
+    # ----- submit -----
+
+    def submit(self, items: List):
+        """QUEUED ← new tests."""
+        with self._lock:
+            self._total_submitted += len(items)
+        for item in items:
+            self._queue.put(item)
+        self._all_submitted.set()
+
+    # ----- get / return work -----
+
+    def get_work(self, worker_id: int, timeout: float = 0.5):
+        """QUEUED → IN_FLIGHT.  Returns item or None."""
+        with self._lock:
+            if self._worker_health.get(worker_id) != 'healthy':
+                return None
+            if self._shutdown.is_set():
+                return None
+
+        try:
+            item = self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+        with self._lock:
+            self._in_flight[worker_id] = item
+        return item
+
+    def release_work(self, worker_id: int):
+        """IN_FLIGHT → QUEUED (worker died without reporting).
+
+        Called automatically by ``set_worker_health(…, 'dead')`` and by
+        the worker loop's finally-block.  Safe to call when there is
+        nothing in-flight for this worker.
+        """
+        with self._lock:
+            item = self._in_flight.pop(worker_id, None)
+        if item is not None:
+            nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+            print(f"   🔄 Scheduler: releasing in-flight test {nodeid} "
+                  f"from worker {worker_id} back to queue")
+            self._queue.put(item)
+
+    # ----- report results -----
+
+    def report_result(self, item, result: 'TestResult', worker_id: int) -> bool:
+        """IN_FLIGHT → RESOLVED  or  IN_FLIGHT → QUEUED (crash restart).
+
+        Returns True if the test was re-queued (not yet terminal).
+        """
+        # Remove from in-flight first (atomically)
+        with self._lock:
+            self._in_flight.pop(worker_id, None)
+
+        if result.crash:
+            return self._handle_crash(item, result, worker_id)
+
+        # Terminal non-crash result
+        self._emit(item, result)
+        return False
+
+    # ----- capacity management -----
+
+    def set_worker_health(self, worker_id: int, health: str):
+        """Update worker capacity.  If 'dead', release any in-flight work."""
+        with self._lock:
+            old = self._worker_health.get(worker_id)
+            self._worker_health[worker_id] = health
+
+        if health == 'dead' and old != 'dead':
+            # Release in-flight test back to queue BEFORE logging
+            self.release_work(worker_id)
+            print(f"   📉 Scheduler: worker {worker_id} capacity → 0 (dead)")
+        elif health == 'healthy' and old != 'healthy':
+            print(f"   📈 Scheduler: worker {worker_id} capacity restored")
+
+    def get_worker_health(self, worker_id: int) -> str:
+        with self._lock:
+            return self._worker_health.get(worker_id, 'dead')
+
+    def healthy_worker_count(self) -> int:
+        with self._lock:
+            return sum(1 for h in self._worker_health.values()
+                       if h == 'healthy')
+
+    # ----- lifecycle -----
+
+    def is_done(self) -> bool:
+        return self._all_done.is_set()
+
+    def wait(self, timeout=None):
+        self._all_done.wait(timeout=timeout)
+
+    def shutdown(self):
+        self._shutdown.set()
+        self._all_done.set()
+
+    @property
+    def stats(self) -> Dict:
+        with self._lock:
+            return dict(self._stats)
+
+    # ----- drain (emergency: all workers dead) -----
+
+    def drain_unresolved(self):
+        """Report all remaining QUEUED + IN_FLIGHT tests as errors.
+
+        Called by ``wait_for_completion`` when every worker has died.
+        Guarantees no test is dropped — each gets exactly one callback.
+        """
+        # 1. Drain in-flight → RESOLVED
+        with self._lock:
+            stranded = dict(self._in_flight)
+            self._in_flight.clear()
+
+        for wid, item in stranded.items():
+            nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+            self._emit(item, TestResult(
+                nodeid=nodeid, outcome='failed', duration=0,
+                longrepr=(f"Worker {wid} died with this test in-flight; "
+                          f"no healthy workers remain"),
+            ))
+
+        # 2. Drain queue → RESOLVED
+        while True:
+            try:
+                item = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+            self._emit(item, TestResult(
+                nodeid=nodeid, outcome='failed', duration=0,
+                longrepr="All workers died; test was never executed",
+            ))
+
+    # ----- internals -----
+
+    def _handle_crash(self, item, result: 'TestResult',
+                      worker_id: int) -> bool:
+        """IN_FLIGHT → QUEUED (restart) or IN_FLIGHT → RESOLVED (give up)."""
+        nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+
+        with self._lock:
+            self._crash_counts[nodeid] = self._crash_counts.get(nodeid, 0) + 1
+            self._crash_workers.setdefault(nodeid, set()).add(worker_id)
+            count = self._crash_counts[nodeid]
+            healthy = sum(1 for h in self._worker_health.values()
+                          if h == 'healthy')
+
+        if count > self._max_crashes or healthy == 0:
+            with self._lock:
+                self._stats['permanent_crashes'] += 1
+            self._emit(item, result)
+            return False
+
+        with self._lock:
+            self._stats['restarts'] += 1
+        print(f"   🔁 Scheduler: re-queuing {nodeid} after crash "
+              f"(attempt {count}/{self._max_crashes}, "
+              f"worker {worker_id} crashed it)")
+        self._queue.put(item)
+        return True
+
+    def _emit(self, item, result: 'TestResult'):
+        """RESOLVED ← item.  Emits callback exactly once per nodeid."""
+        nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+        with self._lock:
+            if nodeid in self._resolved:
+                return  # Already emitted — guard against duplicates
+            self._resolved.add(nodeid)
+            self._total_resolved += 1
+
+        if self._result_callback:
+            self._result_callback(item, result)
+        self._check_done()
+
+    def _check_done(self):
+        with self._lock:
+            if (self._all_submitted.is_set()
+                    and self._total_resolved >= self._total_submitted
+                    and self._queue.empty()
+                    and not self._in_flight):
+                self._all_done.set()
+
+
+class _ScheduledWorkerPool:
+    """Base worker pool using WorkScheduler for capacity-aware scheduling.
+
+    Implements the **Online-Thr-Restarts** model:
+
+    * All tests go into a shared ``WorkScheduler`` queue — no static
+      pre-assignment (which the scheduling paper proves has arbitrarily
+      bad competitive ratio under adversarial crashes).
+    * Workers pull tests on-demand; crashed tests are **re-queued** to
+      healthy workers (Restarts model → 1/2-competitive throughput).
+    * Each worker independently manages GPU recovery.  The scheduler
+      tracks which workers are alive (capacity profile *c(t)*) and
+      stops routing work to dead workers.
+
+    Subclasses ``DynamicWorkerPool`` and ``SlicedWorkerPool`` provide
+    backward-compatible constructors for the two ``--fkit-mode`` values.
+    They share this implementation entirely.
     """
-    
-    def __init__(self, num_workers: int, gpu_allocations: List[str], 
+
+    def __init__(self, num_workers: int, gpu_allocations: List[str],
                  gpu_vendor: str, timeout: int, result_callback: Callable,
                  threads_per_worker: int = 4, max_retries: int = 3):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
         self.timeout = timeout
-        self.result_callback = result_callback
         self.threads_per_worker = threads_per_worker
         self._max_retries = max_retries
-        
-        # Work queue - tests waiting to be executed
-        self.work_queue = queue.Queue()
-        
-        # Results queue - completed test results
-        self.results_queue = queue.Queue()
-        
+
+        # --- Central scheduler (paper §: Online-Thr-Restarts) ---
+        self.scheduler = WorkScheduler(
+            num_workers=num_workers,
+            result_callback=result_callback,
+            max_crashes_per_test=2,
+        )
+
         # Worker state tracking
         self._worker_states = {i: WorkerState.IDLE for i in range(num_workers)}
-        self._worker_error_counts = {i: 0 for i in range(num_workers)}
-        self._max_worker_errors = 3  # Disable worker after this many consecutive errors
-        
-        # Statistics
+
+        # Execution-level statistics (counts every attempt, not just terminals)
         self._lock = threading.Lock()
         self._stats = {
             'tests_run': 0,
@@ -566,16 +933,17 @@ class DynamicWorkerPool:
             'retries': 0,
             'workers_failed': 0,
         }
-        
-        # Control flags
+
+        # Control
         self._shutdown = threading.Event()
-        self._all_submitted = threading.Event()
-        
-        # Worker threads
-        self._workers = []
-    
+        self._workers: List[threading.Thread] = []
+
+    # ------------------------------------------------------------------
+    # GPU environment (identical for both modes)
+    # ------------------------------------------------------------------
+
     def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
-        """Get GPU and CPU environment variables for a worker.
+        """Get GPU, CPU, and NCCL environment variables for a worker.
 
         AMD/ROCm GPU visibility layering:
           ROCR_VISIBLE_DEVICES  – physical GPU indices (ROCm runtime level).
@@ -587,13 +955,13 @@ class DynamicWorkerPool:
           HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
           CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
 
-        Setting all three to "3" would fail because HIP would look for
-        ROCR-index 3 inside a set that only has ROCR-index 0.
+        NCCL/RCCL per-worker isolation:
+          Each worker gets a unique MASTER_PORT so that DataParallel /
+          DistributedDataParallel tests in different workers don't collide.
         """
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
-        
+
         env_vars = {
-            # CPU thread settings - prevent workers from fighting for cores
             'OMP_NUM_THREADS': str(self.threads_per_worker),
             'MKL_NUM_THREADS': str(self.threads_per_worker),
             'NUMEXPR_NUM_THREADS': str(self.threads_per_worker),
@@ -602,13 +970,14 @@ class DynamicWorkerPool:
             'TORCH_NUM_THREADS': str(self.threads_per_worker),
             'FKIT_WORKER_ID': str(worker_id),
             'FKIT_THREADS': str(self.threads_per_worker),
+            'MASTER_PORT': str(NCCL_BASE_PORT + worker_id),
+            'NCCL_ASYNC_ERROR_HANDLING': '1',
+            'NCCL_SOCKET_IFNAME': 'lo',
         }
-        
+
         if gpu_ids:
             if self.gpu_vendor == 'amd':
-                # ROCR uses the physical device indices for /dev/kfd + /dev/dri isolation
                 env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
-                # HIP and CUDA indices are 0-based *within* the ROCR-visible set
                 num_gpus = len(gpu_ids.split(','))
                 hip_ids = ','.join(str(i) for i in range(num_gpus))
                 env_vars['HIP_VISIBLE_DEVICES'] = hip_ids
@@ -617,78 +986,69 @@ class DynamicWorkerPool:
                 env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
             env_vars['FKIT_WORKER_ID'] = str(worker_id)
             env_vars['FKIT_GPU_IDS'] = gpu_ids
-        
+
         return env_vars
-    
-    def _is_gpu_error(self, result: TestResult, stderr: str = "") -> bool:
-        """Detect if a failure was due to GPU issues."""
-        return _is_transient_error(result, stderr)
-    
+
+    # ------------------------------------------------------------------
+    # Worker loop (unified — implements the paper's greedy algorithm)
+    # ------------------------------------------------------------------
+
     def _worker_loop(self, worker_id: int):
-        """Main loop for a worker thread."""
+        """Worker loop with guaranteed no-drop / no-duplicate semantics.
+
+        Every test that is checked out from the scheduler via ``get_work``
+        is **guaranteed** to be returned — either through ``report_result``
+        (normal path) or ``release_work`` (exception / finally path).
+
+        Flow::
+
+            get_work   → item moves QUEUED → IN_FLIGHT
+            try:
+                run test
+                report_result → item moves IN_FLIGHT → RESOLVED or QUEUED
+            finally:
+                release_work  → if still IN_FLIGHT, moves back to QUEUED
+        """
         gpu_env = self._get_gpu_env_vars(worker_id)
         gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
-        
+        max_consecutive_crashes = 3
+        consecutive_crashes = 0
+
+        with self._lock:
+            self._worker_states[worker_id] = WorkerState.RUNNING
+
         while not self._shutdown.is_set():
+            # --- Pull work from scheduler (QUEUED → IN_FLIGHT) ---
+            item = self.scheduler.get_work(worker_id)
+            if item is None:
+                if self.scheduler.is_done() or self._shutdown.is_set():
+                    break
+                time.sleep(0.1)
+                continue
+
+            # --- Execute with finally-guard ---
+            # If anything between get_work and report_result throws,
+            # the finally block releases the test back to the queue.
+            reported = False
             try:
-                # Try to get work with timeout (allows checking shutdown flag)
-                try:
-                    work_item = self.work_queue.get(timeout=0.5)
-                except queue.Empty:
-                    # Check if all work is done
-                    if self._all_submitted.is_set() and self.work_queue.empty():
-                        break
-                    continue
-                
-                # Check if worker is still healthy
-                with self._lock:
-                    if self._worker_states[worker_id] == WorkerState.FAILED:
-                        # Put work back for another worker
-                        self.work_queue.put(work_item)
-                        break
-                    self._worker_states[worker_id] = WorkerState.RUNNING
-                
-                # Run the test
-                result = self._run_test(work_item.nodeid, worker_id, gpu_env)
-                
-                # Check for transient errors (GPU, DNS, network, NCCL)
-                is_transient = result.outcome == 'failed' and _is_transient_error(result)
-                if is_transient:
-                    result.gpu_error = True
-                    
+                result = self._run_test(item.nodeid, worker_id, gpu_env)
+
+                # Retry transient (non-crash) errors in-place
+                retry_count = 0
+                while (result.outcome == 'failed'
+                       and not result.crash
+                       and _is_transient_error(result)
+                       and retry_count < self._max_retries):
+                    retry_count += 1
                     with self._lock:
-                        self._stats['gpu_errors'] += 1
-                        self._worker_error_counts[worker_id] += 1
-                        
-                        # Check if worker should be disabled
-                        if self._worker_error_counts[worker_id] >= self._max_worker_errors:
-                            self._worker_states[worker_id] = WorkerState.FAILED
-                            self._stats['workers_failed'] += 1
-                            print(f"\n⚠️  Worker {worker_id} (GPUs: {gpu_str}) disabled after "
-                                  f"{self._max_worker_errors} consecutive GPU errors")
-                    
-                    # Retry on another worker if allowed
-                    if work_item.retry_count < work_item.max_retries:
-                        work_item.retry_count += 1
-                        with self._lock:
-                            self._stats['retries'] += 1
-                        print(f"   🔄 Retrying {work_item.nodeid} on another worker "
-                              f"(attempt {work_item.retry_count + 1}/{work_item.max_retries})")
-                        self.work_queue.put(work_item)
-                        self.work_queue.task_done()
-                        continue
-                else:
-                    # Reset error count on success
-                    with self._lock:
-                        self._worker_error_counts[worker_id] = 0
-                
-                # GPU cooldown after crash signals (SIGABRT, SIGSEGV, etc.)
-                if result.crash:
-                    print(f"   ⏳ Worker {worker_id}: GPU cooldown after crash "
-                          f"(3s for driver recovery)")
-                    time.sleep(3)
-                
-                # Update stats
+                        self._stats['retries'] += 1
+                    print(f"   🔄 Worker {worker_id}: retrying {item.nodeid} "
+                          f"(attempt {retry_count + 1}/{self._max_retries + 1}, "
+                          f"transient error)")
+                    time.sleep(min(2 ** (retry_count - 1), 4))
+                    result = self._run_test(item.nodeid, worker_id, gpu_env)
+
+                # Execution-level stats
                 with self._lock:
                     self._stats['tests_run'] += 1
                     if result.outcome == 'passed':
@@ -701,749 +1061,329 @@ class DynamicWorkerPool:
                         self._stats['crashes'] += 1
                     if result.timeout:
                         self._stats['timeouts'] += 1
-                    
-                    self._worker_states[worker_id] = WorkerState.IDLE
-                
-                # Report result via callback
-                self.result_callback(work_item.item, result)
-                
-                # Mark work as done
-                self.work_queue.task_done()
-                
+                    if (result.outcome == 'failed'
+                            and not result.crash
+                            and _is_transient_error(result)):
+                        self._stats['gpu_errors'] += 1
+
+                # Report (IN_FLIGHT → RESOLVED or IN_FLIGHT → QUEUED)
+                self.scheduler.report_result(item, result, worker_id)
+                reported = True
+
+                # --- Crash recovery ---
+                if result.crash:
+                    consecutive_crashes += 1
+
+                    if consecutive_crashes > max_consecutive_crashes:
+                        print(f"   ❌ Worker {worker_id} (GPUs: {gpu_str}): "
+                              f"{consecutive_crashes} consecutive crashes, "
+                              f"disabling (capacity → 0)")
+                        self.scheduler.set_worker_health(worker_id, 'dead')
+                        with self._lock:
+                            self._worker_states[worker_id] = WorkerState.FAILED
+                            self._stats['workers_failed'] += 1
+                        break
+
+                    self.scheduler.set_worker_health(worker_id, 'recovering')
+                    print(f"   🔧 Worker {worker_id} (GPUs: {gpu_str}): "
+                          f"crash recovery {consecutive_crashes}/"
+                          f"{max_consecutive_crashes}")
+
+                    _reset_gpu(gpu_env, self.gpu_vendor)
+                    time.sleep(5)
+
+                    if _gpu_health_probe(gpu_env):
+                        self.scheduler.set_worker_health(worker_id, 'healthy')
+                        print(f"   ✓  Worker {worker_id}: GPU healthy, "
+                              f"resuming")
+                        continue
+
+                    print(f"   ⚠️  Worker {worker_id}: GPU unhealthy, "
+                          f"extended wait (10s)...")
+                    time.sleep(10)
+
+                    if _gpu_health_probe(gpu_env):
+                        self.scheduler.set_worker_health(worker_id, 'healthy')
+                        print(f"   ✓  Worker {worker_id}: GPU recovered")
+                        continue
+
+                    print(f"   ❌ Worker {worker_id} (GPUs: {gpu_str}): "
+                          f"GPU unrecoverable, disabling")
+                    self.scheduler.set_worker_health(worker_id, 'dead')
+                    with self._lock:
+                        self._worker_states[worker_id] = WorkerState.FAILED
+                        self._stats['workers_failed'] += 1
+                    break
+                else:
+                    consecutive_crashes = 0
+
             except Exception as e:
-                # Worker encountered an error - mark as failed
+                print(f"\n❌ Worker {worker_id} exception: {e}")
+                self.scheduler.set_worker_health(worker_id, 'dead')
                 with self._lock:
                     self._worker_states[worker_id] = WorkerState.FAILED
                     self._stats['workers_failed'] += 1
-                print(f"\n❌ Worker {worker_id} encountered error: {e}")
                 break
-        
+
+            finally:
+                # Safety net: if report_result was never called, the test
+                # is still IN_FLIGHT.  Release it back to QUEUED so another
+                # worker (or drain_unresolved) can handle it.
+                if not reported:
+                    self.scheduler.release_work(worker_id)
+
+        # Clean exit
         with self._lock:
             if self._worker_states[worker_id] != WorkerState.FAILED:
                 self._worker_states[worker_id] = WorkerState.STOPPED
-    
-    def _run_test(self, nodeid: str, worker_id: int, gpu_env: Dict[str, str]) -> TestResult:
+
+    # ------------------------------------------------------------------
+    # Test execution (subprocess isolation)
+    # ------------------------------------------------------------------
+
+    def _run_test(self, nodeid: str, worker_id: int,
+                  gpu_env: Dict[str, str]) -> TestResult:
         """Run a single test in an isolated subprocess."""
-        import xml.etree.ElementTree as ET
-        
-        junit_fd, junit_path = tempfile.mkstemp(suffix='.xml', prefix=f'fkit_w{worker_id}_')
+        junit_fd, junit_path = tempfile.mkstemp(
+            suffix='.xml', prefix=f'fkit_w{worker_id}_')
         os.close(junit_fd)
-        
+
         try:
             start_time = time.time()
-            
-            # Prepare environment
+
             env = os.environ.copy()
             env.update(gpu_env)
-            
-            # NCCL error recovery: enable async error handling so NCCL
-            # can recover from transient communication failures instead
-            # of hanging or crashing the entire process group.
             env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
-            
-            # Preserve critical variables
-            critical_vars = ['HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
-                           'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
-                           'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE']
-            for var in critical_vars:
+            env.setdefault('MASTER_ADDR', '127.0.0.1')
+            env.setdefault('MASTER_PORT', str(NCCL_BASE_PORT + worker_id))
+
+            for var in ('HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
+                        'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
+                        'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE'):
                 if var in os.environ:
                     env[var] = os.environ[var]
-            
-            # Build pytest command
+
             pytest_cmd = [
                 sys.executable, '-m', 'pytest',
-                nodeid,
-                '-v',
-                '--tb=short',
+                nodeid, '-v', '--tb=short',
                 '--continue-on-collection-errors',
                 '-p', 'no:cacheprovider',
                 '-p', 'no:fkit',
                 f'--junitxml={junit_path}',
             ]
-            
+
             try:
-                result = subprocess.run(
-                    pytest_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    cwd=str(Path.cwd()),
-                    env=env,
+                proc = subprocess.run(
+                    pytest_cmd, capture_output=True, text=True,
+                    timeout=self.timeout, cwd=str(Path.cwd()), env=env,
                 )
-                
+
                 duration = time.time() - start_time
-                outcome, skip_reason, fail_message = self._parse_junit_result(junit_path)
-                
-                if result.returncode == 0:
+                outcome, skip_reason, fail_message = \
+                    self._parse_junit_result(junit_path)
+
+                if proc.returncode == 0:
                     if outcome == 'skipped':
                         return TestResult(
-                            nodeid=nodeid,
-                            outcome='skipped',
-                            duration=duration,
-                            skip_reason=skip_reason,
-                            worker_id=worker_id
-                        )
-                    else:
-                        return TestResult(
-                            nodeid=nodeid,
-                            outcome='passed',
-                            duration=duration,
-                            worker_id=worker_id
-                        )
-                
-                elif result.returncode < 0:
-                    # Process killed by signal - CRASH!
-                    signal_num = -result.returncode
-                    signal_names = {
+                            nodeid=nodeid, outcome='skipped',
+                            duration=duration, skip_reason=skip_reason,
+                            worker_id=worker_id)
+                    return TestResult(
+                        nodeid=nodeid, outcome='passed',
+                        duration=duration, worker_id=worker_id)
+
+                if proc.returncode < 0:
+                    sig = -proc.returncode
+                    sig_names = {
                         signal.SIGABRT: "SIGABRT (Aborted)",
                         signal.SIGSEGV: "SIGSEGV (Segmentation Fault)",
                         signal.SIGTERM: "SIGTERM (Terminated)",
                         signal.SIGKILL: "SIGKILL (Killed)",
                     }
-                    signal_name = signal_names.get(signal_num, f"Signal {signal_num}")
-                    
+                    sig_name = sig_names.get(sig, f"Signal {sig}")
                     crash_info = (
                         f"\n{'='*70}\n"
-                        f"💥 TEST CRASHED: {signal_name} (Worker {worker_id}, GPUs: {gpu_env.get('FKIT_GPU_IDS', 'N/A')})\n"
+                        f"💥 TEST CRASHED: {sig_name} "
+                        f"(Worker {worker_id}, GPUs: "
+                        f"{gpu_env.get('FKIT_GPU_IDS', 'N/A')})\n"
                         f"{'='*70}\n"
-                        f"\nThis test caused Python to crash with {signal_name}.\n"
-                        f"pytest-fkit caught it and converted it to an ERROR.\n"
-                        f"\n--- STDOUT ---\n{result.stdout[-4000:] if len(result.stdout) > 4000 else result.stdout}\n"
-                        f"\n--- STDERR ---\n{result.stderr[-4000:] if len(result.stderr) > 4000 else result.stderr}\n"
+                        f"\nThis test caused Python to crash with "
+                        f"{sig_name}.\npytest-fkit caught it and "
+                        f"converted it to an ERROR.\n"
+                        f"\n--- STDOUT ---\n"
+                        f"{proc.stdout[-4000:] if len(proc.stdout) > 4000 else proc.stdout}\n"
+                        f"\n--- STDERR ---\n"
+                        f"{proc.stderr[-4000:] if len(proc.stderr) > 4000 else proc.stderr}\n"
                         f"{'='*70}\n"
                     )
-                    
                     return TestResult(
-                        nodeid=nodeid,
-                        outcome='failed',
-                        duration=duration,
-                        longrepr=crash_info,
-                        crash=True,
-                        worker_id=worker_id
-                    )
-                
-                else:
-                    # Normal failure - prefer structured JUnit failure message
-                    if fail_message:
-                        fail_info = fail_message
-                    else:
-                        # Fallback: extract failure info from subprocess output
-                        fail_info = _extract_failure_from_output(result.stdout, result.stderr)
-                    return TestResult(
-                        nodeid=nodeid,
-                        outcome='failed',
-                        duration=duration,
-                        longrepr=fail_info,
-                        worker_id=worker_id
-                    )
-            
+                        nodeid=nodeid, outcome='failed',
+                        duration=duration, longrepr=crash_info,
+                        crash=True, worker_id=worker_id)
+
+                # Normal failure
+                fail_info = (fail_message if fail_message
+                             else _extract_failure_from_output(
+                                 proc.stdout, proc.stderr))
+                return TestResult(
+                    nodeid=nodeid, outcome='failed',
+                    duration=duration, longrepr=fail_info,
+                    worker_id=worker_id)
+
             except subprocess.TimeoutExpired as e:
                 duration = time.time() - start_time
-                
                 timeout_info = (
                     f"\n{'='*70}\n"
                     f"⏱️  TEST TIMEOUT (Worker {worker_id})\n"
                     f"{'='*70}\n"
-                    f"\nTest exceeded timeout of {self.timeout} seconds.\n"
-                    f"pytest-fkit terminated it and converted it to an ERROR.\n"
-                    f"\n--- PARTIAL STDOUT ---\n{e.stdout if e.stdout else '(none)'}\n"
-                    f"\n--- PARTIAL STDERR ---\n{e.stderr if e.stderr else '(none)'}\n"
+                    f"\nTest exceeded timeout of {self.timeout}s.\n"
+                    f"pytest-fkit terminated it and converted it to an "
+                    f"ERROR.\n"
+                    f"\n--- PARTIAL STDOUT ---\n"
+                    f"{e.stdout if e.stdout else '(none)'}\n"
+                    f"\n--- PARTIAL STDERR ---\n"
+                    f"{e.stderr if e.stderr else '(none)'}\n"
                     f"{'='*70}\n"
                 )
-                
                 return TestResult(
-                    nodeid=nodeid,
-                    outcome='failed',
-                    duration=duration,
-                    longrepr=timeout_info,
-                    timeout=True,
-                    worker_id=worker_id
-                )
-        
+                    nodeid=nodeid, outcome='failed',
+                    duration=duration, longrepr=timeout_info,
+                    timeout=True, worker_id=worker_id)
         finally:
             try:
                 os.unlink(junit_path)
-            except:
+            except Exception:
                 pass
-    
-    def _parse_junit_result(self, junit_path: str) -> tuple:
-        """Parse JUnit XML for outcome, skip reason, and failure message.
-        
-        Returns:
-            (outcome, skip_reason, failure_message) tuple
-        """
-        import xml.etree.ElementTree as ET
-        
+
+    def _parse_junit_result(self, junit_path: str) -> Tuple[str, Optional[str], Optional[str]]:
+        """Parse JUnit XML for outcome, skip reason, and failure message."""
         try:
             if not os.path.exists(junit_path):
                 return 'unknown', None, None
-            
             tree = ET.parse(junit_path)
             root = tree.getroot()
-            
-            for testcase in root.findall('.//testcase'):
-                skipped = testcase.find('skipped')
-                if skipped is not None:
-                    reason = skipped.get('message') or skipped.text or "Skipped"
-                    return 'skipped', reason, None
-                
-                failure = testcase.find('failure')
-                if failure is not None:
-                    fail_msg = failure.get('message', '')
-                    fail_text = failure.text or ''
-                    return 'failed', None, f"{fail_msg}\n{fail_text}".strip()
-                
-                error = testcase.find('error')
-                if error is not None:
-                    err_msg = error.get('message', '')
-                    err_text = error.text or ''
-                    return 'failed', None, f"{err_msg}\n{err_text}".strip()
-                
+            for tc in root.findall('.//testcase'):
+                sk = tc.find('skipped')
+                if sk is not None:
+                    return ('skipped',
+                            sk.get('message') or sk.text or "Skipped",
+                            None)
+                fa = tc.find('failure')
+                if fa is not None:
+                    return ('failed', None,
+                            f"{fa.get('message', '')}\n{fa.text or ''}".strip())
+                er = tc.find('error')
+                if er is not None:
+                    return ('failed', None,
+                            f"{er.get('message', '')}\n{er.text or ''}".strip())
                 return 'passed', None, None
-            
             return 'unknown', None, None
         except Exception:
             return 'unknown', None, None
-    
+
+    # ------------------------------------------------------------------
+    # Public API (same interface for both modes)
+    # ------------------------------------------------------------------
+
     def submit_tests(self, items: List):
-        """Submit tests to the work queue."""
-        for item in items:
-            work_item = WorkItem(nodeid=item.nodeid, item=item,
-                                 max_retries=self._max_retries)
-            self.work_queue.put(work_item)
-        self._all_submitted.set()
-    
+        """Submit all tests into the scheduler's shared work queue."""
+        print(f"\n📊 Submitting {len(items)} tests to shared scheduler "
+              f"({self.num_workers} workers)")
+        self.scheduler.submit(items)
+
     def start(self):
         """Start all worker threads."""
-        for worker_id in range(self.num_workers):
-            thread = threading.Thread(
-                target=self._worker_loop,
-                args=(worker_id,),
-                name=f"fkit-worker-{worker_id}",
-                daemon=True
-            )
-            self._workers.append(thread)
-            thread.start()
-    
+        for wid in range(self.num_workers):
+            t = threading.Thread(
+                target=self._worker_loop, args=(wid,),
+                name=f"fkit-worker-{wid}", daemon=True)
+            self._workers.append(t)
+            t.start()
+
     def wait_for_completion(self):
-        """Wait for all tests to complete."""
-        # Wait for queue to be empty
-        self.work_queue.join()
-        
-        # Signal shutdown
+        """Wait for all tests to reach a terminal state.
+
+        If all workers die before all tests are resolved, calls
+        ``drain_unresolved()`` to report remaining tests as errors.
+        This guarantees **no test is dropped** — every submitted test
+        gets exactly one result callback.
+        """
+        while not self.scheduler.is_done() and not self._shutdown.is_set():
+            self.scheduler.wait(timeout=1.0)
+
+            # Check if all workers have exited
+            with self._lock:
+                alive = any(
+                    st not in (WorkerState.FAILED, WorkerState.STOPPED)
+                    for st in self._worker_states.values()
+                )
+
+            if not alive and not self.scheduler.is_done():
+                # All workers dead with tests remaining — drain them
+                print("\n⚠️  All workers dead — draining remaining tests "
+                      "as errors")
+                self.scheduler.drain_unresolved()
+                break
+
         self._shutdown.set()
-        
-        # Wait for all workers to finish
-        for thread in self._workers:
-            thread.join(timeout=5.0)
-    
+        for t in self._workers:
+            t.join(timeout=5.0)
+
     def shutdown(self):
-        """Force shutdown all workers."""
+        """Force shutdown."""
         self._shutdown.set()
-        for thread in self._workers:
-            thread.join(timeout=1.0)
-    
+        self.scheduler.shutdown()
+        for t in self._workers:
+            t.join(timeout=1.0)
+
     @property
     def stats(self):
         with self._lock:
-            return dict(self._stats)
-    
+            s = dict(self._stats)
+        # Merge scheduler-level stats
+        sched = self.scheduler.stats
+        s['restarts'] = sched.get('restarts', 0)
+        s['permanent_crashes'] = sched.get('permanent_crashes', 0)
+        return s
+
     @property
     def active_workers(self) -> int:
-        """Count of workers that haven't failed."""
         with self._lock:
-            return sum(1 for state in self._worker_states.values() 
-                      if state not in (WorkerState.FAILED, WorkerState.STOPPED))
+            return sum(1 for st in self._worker_states.values()
+                       if st not in (WorkerState.FAILED, WorkerState.STOPPED))
 
 
-class SlicedWorkerPool:
+class DynamicWorkerPool(_ScheduledWorkerPool):
+    """Dynamic scheduling mode (``--fkit-mode=isolate``).
+
+    All tests go into a shared queue; workers pull on-demand.
+    Backward-compatible constructor — delegates entirely to the base.
     """
-    Pool of workers with pre-sliced test distribution and dynamic failover.
-    
-    Tests are distributed upfront using round-robin slicing:
-    1. Tests are sorted and sliced across workers deterministically
-    2. Each worker runs its slice of tests sequentially
-    3. Each test still runs in its own subprocess for crash isolation
-    4. Workers run in parallel for speed
-    5. If a worker encounters GPU errors, remaining tests go to overflow queue
-    6. Healthy workers pick up overflow tests when they finish their slice
-    
-    This provides:
-    - Deterministic distribution (reproducible test assignments)
-    - Crash isolation (subprocess per test)
-    - GPU affinity (each worker has dedicated GPUs)
-    - CPU thread affinity (each worker gets fair share of cores)
-    - Parallel execution across workers
-    - Dynamic failover for GPU failures
+    pass
+
+
+class SlicedWorkerPool(_ScheduledWorkerPool):
+    """Scheduled mode (``--fkit-mode=batch``).
+
+    Formerly used static pre-slicing (which has arbitrarily bad
+    competitive ratio under crashes — see scheduling paper §: NoRestarts).
+    Now uses the same shared-queue scheduler as DynamicWorkerPool
+    (Online-Thr-Restarts → 1/2-competitive).
+
+    The ``slice_tests_to_workers`` function is retained for *display*
+    purposes only (showing the initial round-robin distribution).
     """
-    
-    def __init__(self, num_workers: int, gpu_allocations: List[str], 
-                 gpu_vendor: str, timeout: int, result_callback: Callable,
-                 threads_per_worker: int = 4, max_retries: int = 3):
-        self.num_workers = num_workers
-        self.gpu_allocations = gpu_allocations
-        self.gpu_vendor = gpu_vendor
-        self.timeout = timeout
-        self.result_callback = result_callback
-        self.threads_per_worker = threads_per_worker
-        self._max_retries = max_retries
-        
-        # Pre-sliced test lists for each worker
-        self._worker_slices: List[List] = []
-        
-        # Overflow queue for tests from failed workers
-        self._overflow_queue = queue.Queue()
-        
-        # Worker state tracking
-        self._worker_states = {i: WorkerState.IDLE for i in range(num_workers)}
-        self._worker_gpu_error_counts = {i: 0 for i in range(num_workers)}
-        self._max_gpu_errors = 3  # After this many GPU errors, worker moves tests to overflow
-        
-        # Statistics
-        self._lock = threading.Lock()
-        self._stats = {
-            'tests_run': 0,
-            'tests_passed': 0,
-            'tests_failed': 0,
-            'tests_skipped': 0,
-            'crashes': 0,
-            'timeouts': 0,
-            'gpu_errors': 0,
-            'retries': 0,
-            'redistributed': 0,
-            'workers_failed': 0,
-        }
-        
-        # Control flags
-        self._shutdown = threading.Event()
-        self._all_slices_done = threading.Event()
-        
-        # Worker threads
-        self._workers = []
-        
-        # Item map for result reporting
-        self._item_map = {}
-    
-    def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
-        """Get GPU and CPU environment variables for a worker.
 
-        AMD/ROCm GPU visibility layering:
-          ROCR_VISIBLE_DEVICES  – physical GPU indices (ROCm runtime level).
-          HIP_VISIBLE_DEVICES   – indices *relative to* the ROCR-visible set.
-          CUDA_VISIBLE_DEVICES  – PyTorch ROCm maps this to HIP_VISIBLE_DEVICES.
-
-        If a worker owns physical GPU 3, we set:
-          ROCR_VISIBLE_DEVICES=3   (expose only that physical GPU)
-          HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
-          CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
-
-        Setting all three to "3" would fail because HIP would look for
-        ROCR-index 3 inside a set that only has ROCR-index 0.
-        """
-        gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
-        
-        env_vars = {
-            # CPU thread settings - prevent workers from fighting for cores
-            'OMP_NUM_THREADS': str(self.threads_per_worker),
-            'MKL_NUM_THREADS': str(self.threads_per_worker),
-            'NUMEXPR_NUM_THREADS': str(self.threads_per_worker),
-            'OPENBLAS_NUM_THREADS': str(self.threads_per_worker),
-            'VECLIB_MAXIMUM_THREADS': str(self.threads_per_worker),
-            # PyTorch specific
-            'TORCH_NUM_THREADS': str(self.threads_per_worker),
-            # Worker identification
-            'FKIT_WORKER_ID': str(worker_id),
-            'FKIT_THREADS': str(self.threads_per_worker),
-        }
-        
-        if gpu_ids:
-            if self.gpu_vendor == 'amd':
-                # ROCR uses the physical device indices for /dev/kfd + /dev/dri isolation
-                env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
-                # HIP and CUDA indices are 0-based *within* the ROCR-visible set
-                num_gpus = len(gpu_ids.split(','))
-                hip_ids = ','.join(str(i) for i in range(num_gpus))
-                env_vars['HIP_VISIBLE_DEVICES'] = hip_ids
-                env_vars['CUDA_VISIBLE_DEVICES'] = hip_ids
-            elif self.gpu_vendor == 'nvidia':
-                env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
-            env_vars['FKIT_WORKER_ID'] = str(worker_id)
-            env_vars['FKIT_GPU_IDS'] = gpu_ids
-        
-        return env_vars
-    
-    def _is_gpu_error(self, result: TestResult, stderr: str = "") -> bool:
-        """Detect if a failure was due to GPU or transient issues."""
-        return _is_transient_error(result, stderr)
-    
-    def _worker_loop(self, worker_id: int, test_slice: List):
-        """Main loop for a worker - runs its pre-assigned slice with GPU failover.
-        
-        Enhanced with per-test retry for transient errors (GPU unavailable,
-        DNS resolution, network failures, NCCL errors). A test is retried
-        up to max_retries times on the SAME worker before being counted as
-        a real failure. After max_gpu_errors consecutive transient failures,
-        remaining tests are redistributed to healthy workers.
-        """
-        gpu_env = self._get_gpu_env_vars(worker_id)
-        gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
-        
-        slice_size = len(test_slice)
-        print(f"   Worker {worker_id} (GPUs: {gpu_str}): {slice_size} tests")
-        
-        with self._lock:
-            self._worker_states[worker_id] = WorkerState.RUNNING
-        
-        consecutive_gpu_errors = 0
-        last_test_crashed = False  # Track crash state for accelerated redistribution
-        
-        for idx, item in enumerate(test_slice):
-            if self._shutdown.is_set():
-                break
-            
-            # After a crash, lower the redistribution threshold: if the NEXT
-            # test also hits a transient GPU error, the GPU is likely stuck.
-            effective_max_errors = 1 if last_test_crashed else self._max_gpu_errors
-            
-            # Check if this worker should stop due to GPU errors
-            if consecutive_gpu_errors >= effective_max_errors:
-                # Move remaining tests to overflow queue for healthy workers
-                remaining = test_slice[idx:]
-                with self._lock:
-                    self._stats['redistributed'] += len(remaining)
-                    self._stats['workers_failed'] += 1
-                    self._worker_states[worker_id] = WorkerState.FAILED
-                reason = "post-crash GPU failure" if last_test_crashed else "transient errors"
-                print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): {reason} detected, "
-                      f"redistributing {len(remaining)} remaining tests")
-                for remaining_item in remaining:
-                    self._overflow_queue.put(remaining_item)
-                return
-            
-            # Run the test with retry logic for transient errors
-            max_retries = getattr(self, '_max_retries', 3)
-            result = self._run_test(item.nodeid, worker_id, gpu_env)
-            retry_count = 0
-            
-            while (result.outcome == 'failed' 
-                   and _is_transient_error(result)
-                   and retry_count < max_retries):
-                retry_count += 1
-                with self._lock:
-                    self._stats['retries'] = self._stats.get('retries', 0) + 1
-                print(f"   🔄 Worker {worker_id}: Retrying {item.nodeid} "
-                      f"(attempt {retry_count + 1}/{max_retries + 1}, transient error)")
-                # Brief pause before retry (exponential backoff: 1s, 2s, 4s)
-                time.sleep(min(2 ** (retry_count - 1), 4))
-                result = self._run_test(item.nodeid, worker_id, gpu_env)
-            
-            # Check if the final result is still a transient error
-            if result.outcome == 'failed' and _is_transient_error(result):
-                consecutive_gpu_errors += 1
-                with self._lock:
-                    self._stats['gpu_errors'] += 1
-            else:
-                consecutive_gpu_errors = 0  # Reset on success or non-transient failure
-            
-            # GPU cooldown after crash signals (SIGABRT, SIGSEGV, etc.)
-            # The ROCm/CUDA driver may need time to reclaim resources from
-            # the crashed process before the next subprocess can init the GPU.
-            if result.crash:
-                last_test_crashed = True
-                print(f"   ⏳ Worker {worker_id}: GPU cooldown after crash "
-                      f"(3s for driver recovery)")
-                time.sleep(3)
-            else:
-                last_test_crashed = False
-            
-            # Update stats
-            with self._lock:
-                self._stats['tests_run'] += 1
-                if result.outcome == 'passed':
-                    self._stats['tests_passed'] += 1
-                elif result.outcome == 'skipped':
-                    self._stats['tests_skipped'] += 1
-                else:
-                    self._stats['tests_failed'] += 1
-                if result.crash:
-                    self._stats['crashes'] += 1
-                if result.timeout:
-                    self._stats['timeouts'] += 1
-            
-            # Report result via callback
-            self.result_callback(item, result)
-        
-        with self._lock:
-            self._worker_states[worker_id] = WorkerState.STOPPED
-        
-        # After finishing slice, help with overflow queue
-        self._process_overflow(worker_id, gpu_env)
-    
-    def _process_overflow(self, worker_id: int, gpu_env: Dict[str, str]):
-        """Process tests from overflow queue (from failed workers).
-        
-        Redistributed tests also get retry logic for transient errors.
-        """
-        gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
-        
-        while not self._shutdown.is_set():
-            try:
-                item = self._overflow_queue.get_nowait()
-            except queue.Empty:
-                break
-            
-            print(f"   Worker {worker_id} (GPUs: {gpu_str}): picking up redistributed test")
-            result = self._run_test(item.nodeid, worker_id, gpu_env)
-            
-            # Retry transient errors on this (healthy) worker
-            retry_count = 0
-            while (result.outcome == 'failed'
-                   and _is_transient_error(result)
-                   and retry_count < self._max_retries):
-                retry_count += 1
-                with self._lock:
-                    self._stats['retries'] += 1
-                print(f"   🔄 Worker {worker_id}: Retrying redistributed {item.nodeid} "
-                      f"(attempt {retry_count + 1}/{self._max_retries + 1})")
-                time.sleep(min(2 ** (retry_count - 1), 4))
-                result = self._run_test(item.nodeid, worker_id, gpu_env)
-            
-            with self._lock:
-                self._stats['tests_run'] += 1
-                if result.outcome == 'passed':
-                    self._stats['tests_passed'] += 1
-                elif result.outcome == 'skipped':
-                    self._stats['tests_skipped'] += 1
-                else:
-                    self._stats['tests_failed'] += 1
-                if result.crash:
-                    self._stats['crashes'] += 1
-                if result.timeout:
-                    self._stats['timeouts'] += 1
-            
-            self.result_callback(item, result)
-            self._overflow_queue.task_done()
-    
-    def _run_test(self, nodeid: str, worker_id: int, gpu_env: Dict[str, str]) -> TestResult:
-        """Run a single test in an isolated subprocess."""
-        junit_fd, junit_path = tempfile.mkstemp(suffix='.xml', prefix=f'fkit_w{worker_id}_')
-        os.close(junit_fd)
-        
-        try:
-            start_time = time.time()
-            
-            # Prepare environment
-            env = os.environ.copy()
-            env.update(gpu_env)
-            
-            # NCCL error recovery: enable async error handling so NCCL
-            # can recover from transient communication failures instead
-            # of hanging or crashing the entire process group.
-            env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
-            
-            # Preserve critical variables
-            critical_vars = ['HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
-                           'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
-                           'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE']
-            for var in critical_vars:
-                if var in os.environ:
-                    env[var] = os.environ[var]
-            
-            # Build pytest command
-            pytest_cmd = [
-                sys.executable, '-m', 'pytest',
-                nodeid,
-                '-v',
-                '--tb=short',
-                '--continue-on-collection-errors',
-                '-p', 'no:cacheprovider',
-                '-p', 'no:fkit',  # Disable fkit in subprocess to prevent recursion
-                f'--junitxml={junit_path}',
-            ]
-            
-            try:
-                result = subprocess.run(
-                    pytest_cmd,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                    cwd=str(Path.cwd()),
-                    env=env,
-                )
-                
-                duration = time.time() - start_time
-                outcome, skip_reason, fail_message = self._parse_junit_result(junit_path)
-                
-                if result.returncode == 0:
-                    if outcome == 'skipped':
-                        return TestResult(
-                            nodeid=nodeid,
-                            outcome='skipped',
-                            duration=duration,
-                            skip_reason=skip_reason,
-                            worker_id=worker_id
-                        )
-                    else:
-                        return TestResult(
-                            nodeid=nodeid,
-                            outcome='passed',
-                            duration=duration,
-                            worker_id=worker_id
-                        )
-                
-                elif result.returncode < 0:
-                    # Process killed by signal - CRASH!
-                    signal_num = -result.returncode
-                    signal_names = {
-                        signal.SIGABRT: "SIGABRT (Aborted)",
-                        signal.SIGSEGV: "SIGSEGV (Segmentation Fault)",
-                        signal.SIGTERM: "SIGTERM (Terminated)",
-                        signal.SIGKILL: "SIGKILL (Killed)",
-                    }
-                    signal_name = signal_names.get(signal_num, f"Signal {signal_num}")
-                    
-                    crash_info = (
-                        f"\n{'='*70}\n"
-                        f"💥 TEST CRASHED: {signal_name} (Worker {worker_id}, GPUs: {gpu_env.get('FKIT_GPU_IDS', 'N/A')})\n"
-                        f"{'='*70}\n"
-                        f"\nThis test caused Python to crash with {signal_name}.\n"
-                        f"pytest-fkit caught it and converted it to an ERROR.\n"
-                        f"\n--- STDOUT ---\n{result.stdout[-4000:] if len(result.stdout) > 4000 else result.stdout}\n"
-                        f"\n--- STDERR ---\n{result.stderr[-4000:] if len(result.stderr) > 4000 else result.stderr}\n"
-                        f"{'='*70}\n"
-                    )
-                    
-                    return TestResult(
-                        nodeid=nodeid,
-                        outcome='failed',
-                        duration=duration,
-                        longrepr=crash_info,
-                        crash=True,
-                        worker_id=worker_id
-                    )
-                
-                else:
-                    # Normal failure - prefer structured JUnit failure message
-                    if fail_message:
-                        fail_info = fail_message
-                    else:
-                        # Fallback: extract failure info from subprocess output
-                        fail_info = _extract_failure_from_output(result.stdout, result.stderr)
-                    return TestResult(
-                        nodeid=nodeid,
-                        outcome='failed',
-                        duration=duration,
-                        longrepr=fail_info,
-                        worker_id=worker_id
-                    )
-            
-            except subprocess.TimeoutExpired as e:
-                duration = time.time() - start_time
-                
-                timeout_info = (
-                    f"\n{'='*70}\n"
-                    f"⏱️  TEST TIMEOUT (Worker {worker_id})\n"
-                    f"{'='*70}\n"
-                    f"\nTest exceeded timeout of {self.timeout} seconds.\n"
-                    f"pytest-fkit terminated it and converted it to an ERROR.\n"
-                    f"\n--- PARTIAL STDOUT ---\n{e.stdout if e.stdout else '(none)'}\n"
-                    f"\n--- PARTIAL STDERR ---\n{e.stderr if e.stderr else '(none)'}\n"
-                    f"{'='*70}\n"
-                )
-                
-                return TestResult(
-                    nodeid=nodeid,
-                    outcome='failed',
-                    duration=duration,
-                    longrepr=timeout_info,
-                    timeout=True,
-                    worker_id=worker_id
-                )
-        
-        finally:
-            try:
-                os.unlink(junit_path)
-            except:
-                pass
-    
-    def _parse_junit_result(self, junit_path: str) -> Tuple[str, Optional[str], Optional[str]]:
-        """Parse JUnit XML for outcome, skip reason, and failure message.
-        
-        Returns:
-            (outcome, skip_reason, failure_message) tuple
-        """
-        try:
-            if not os.path.exists(junit_path):
-                return 'unknown', None, None
-            
-            tree = ET.parse(junit_path)
-            root = tree.getroot()
-            
-            for testcase in root.findall('.//testcase'):
-                skipped = testcase.find('skipped')
-                if skipped is not None:
-                    reason = skipped.get('message') or skipped.text or "Skipped"
-                    return 'skipped', reason, None
-                
-                failure = testcase.find('failure')
-                if failure is not None:
-                    fail_msg = failure.get('message', '')
-                    fail_text = failure.text or ''
-                    return 'failed', None, f"{fail_msg}\n{fail_text}".strip()
-                
-                error = testcase.find('error')
-                if error is not None:
-                    err_msg = error.get('message', '')
-                    err_text = error.text or ''
-                    return 'failed', None, f"{err_msg}\n{err_text}".strip()
-                
-                return 'passed', None, None
-            
-            return 'unknown', None, None
-        except Exception:
-            return 'unknown', None, None
-    
     def submit_tests(self, items: List):
-        """Slice and distribute tests to workers."""
-        self._worker_slices = slice_tests_to_workers(items, self.num_workers)
-        self._item_map = {item.nodeid: item for item in items}
-        
-        # Print distribution info
-        print(f"\n📊 Test distribution across {self.num_workers} workers:")
-        for i, slice_items in enumerate(self._worker_slices):
-            print(f"   Worker {i}: {len(slice_items)} tests")
-    
-    def start(self):
-        """Start all worker threads with their pre-assigned slices."""
-        for worker_id in range(self.num_workers):
-            test_slice = self._worker_slices[worker_id] if worker_id < len(self._worker_slices) else []
-            if not test_slice:
-                continue
-                
-            thread = threading.Thread(
-                target=self._worker_loop,
-                args=(worker_id, test_slice),
-                name=f"fkit-worker-{worker_id}",
-                daemon=True
-            )
-            self._workers.append(thread)
-            thread.start()
-    
-    def wait_for_completion(self):
-        """Wait for all workers to complete their slices."""
-        for thread in self._workers:
-            thread.join()
-    
-    def shutdown(self):
-        """Force shutdown all workers."""
-        self._shutdown.set()
-        for thread in self._workers:
-            thread.join(timeout=1.0)
-    
-    @property
-    def stats(self):
-        with self._lock:
-            return dict(self._stats)
+        """Submit tests and show the initial round-robin distribution."""
+        slices = slice_tests_to_workers(items, self.num_workers)
+        print(f"\n📊 Initial round-robin distribution "
+              f"({self.num_workers} workers, "
+              f"shared-queue scheduling):")
+        for i, s in enumerate(slices):
+            print(f"   Worker {i}: {len(s)} tests (initial)")
+        # All tests go into the shared scheduler queue
+        self.scheduler.submit(items)
 
 
 class CrashIsolationPlugin:
@@ -1523,6 +1463,9 @@ class CrashIsolationPlugin:
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
+            print(f"   NCCL ports: {NCCL_BASE_PORT}-{NCCL_BASE_PORT + self.num_workers - 1} "
+                  f"(per-worker isolation)")
+            print(f"   Crash recovery: GPU health probe + 5-15s cooldown + auto-redistribute")
             # GPU preflight: verify each worker can see its GPU from a subprocess
             self._gpu_preflight()
         else:
@@ -1662,22 +1605,24 @@ class CrashIsolationPlugin:
         # Print summary
         stats = self.worker_pool.stats
         print(f"\n{'='*70}")
-        print(f"✅ Completed {stats['tests_run']} tests")
+        print(f"✅ Completed {stats['tests_run']} test executions")
         print(f"   Passed: {stats['tests_passed']}, Failed: {stats['tests_failed']}, "
               f"Skipped: {stats['tests_skipped']}")
         if stats['crashes'] > 0:
-            print(f"   💥 Crashes: {stats['crashes']}")
+            restarts = stats.get('restarts', 0)
+            perm = stats.get('permanent_crashes', 0)
+            restart_info = ""
+            if restarts:
+                restart_info = f" ({restarts} restarted on healthy workers"
+                if perm:
+                    restart_info += f", {perm} permanently failed"
+                restart_info += ")"
+            print(f"   💥 Crashes: {stats['crashes']}{restart_info}")
         if stats['timeouts'] > 0:
             print(f"   ⏱️  Timeouts: {stats['timeouts']}")
         if stats['gpu_errors'] > 0:
             retries = stats.get('retries', 0)
-            redistributed = stats.get('redistributed', 0)
-            extra_parts = []
-            if retries:
-                extra_parts.append(f"retries: {retries}")
-            if redistributed:
-                extra_parts.append(f"redistributed: {redistributed}")
-            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
+            extra = f" (retries: {retries})" if retries else ""
             print(f"   🎮 GPU errors: {stats['gpu_errors']}{extra}")
         if stats.get('workers_failed', 0) > 0:
             print(f"   ⚠️  Workers disabled: {stats['workers_failed']}")

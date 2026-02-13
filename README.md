@@ -262,29 +262,46 @@ tests/models/whisper/test_modeling_whisper.py::WhisperModelTest::test_forward PA
 | `--fkit-workers` | `1` | Number of parallel workers (`auto` for GPU-based) |
 | `--fkit-gpus-per-worker` | `2` | GPUs assigned to each worker |
 | `--fkit-mode` | `batch` | `batch` (pre-sliced) or `isolate` (dynamic queue) |
+| `--fkit-threads-per-worker` | `auto` | CPU threads per worker (`auto` = cores/workers) |
+| `--fkit-max-retries` | `3` | Max retries for transient errors |
 
 ## Environment Variables Set Per Worker
 
 | Variable | Description |
 |----------|-------------|
 | `CUDA_VISIBLE_DEVICES` | GPU IDs for NVIDIA / compatibility |
-| `HIP_VISIBLE_DEVICES` | GPU IDs for AMD ROCm |
-| `ROCR_VISIBLE_DEVICES` | GPU IDs for AMD ROCm runtime |
+| `HIP_VISIBLE_DEVICES` | GPU IDs for AMD ROCm (0-based within ROCR set) |
+| `ROCR_VISIBLE_DEVICES` | Physical GPU IDs for AMD ROCm runtime |
 | `FKIT_WORKER_ID` | Worker index (0, 1, 2, ...) |
-| `FKIT_GPU_IDS` | Assigned GPU IDs string |
+| `FKIT_GPU_IDS` | Assigned physical GPU IDs string |
+| `MASTER_PORT` | Per-worker NCCL port (29500 + worker_id) |
+| `MASTER_ADDR` | NCCL address (127.0.0.1) |
+| `NCCL_ASYNC_ERROR_HANDLING` | Enabled (prevents NCCL hangs) |
+| `NCCL_SOCKET_IFNAME` | Loopback interface (avoids NIC issues) |
+| `OMP_NUM_THREADS` | CPU threads per worker |
+
+## Crash Recovery
+
+After a test crash (SIGABRT, SIGSEGV, etc.):
+
+1. **5s cooldown** for GPU driver to reclaim resources
+2. **GPU health probe** - spawns subprocess to allocate a tensor and sync
+3. If probe fails, **10s extended cooldown** + second probe
+4. If still unhealthy, **worker disabled** and remaining tests redistributed to healthy workers
+5. If healthy, continue with next test
+
+This prevents the cascade where one crash leaves the GPU unusable and all subsequent tests on that worker fail with "No HIP GPUs are available".
 
 ## GPU Error Patterns Detected
 
-The following error patterns trigger automatic retry on a different worker:
+The following error patterns trigger automatic retry:
 
-- `CUDA out of memory`
-- `CUDA error` / `HIP error`
-- `hipErrorNoBinaryForGpu`
-- `hipErrorOutOfMemory`
-- `NCCL error`
-- `device-side assert`
-- `GPU not found` / `no GPU`
-- `cudaErrorNoDevice` / `hipErrorNoDevice`
+- `No HIP GPUs are available` / `No CUDA GPUs are available`
+- `CUDA out of memory` / `hipErrorOutOfMemory` / `HIP out of memory`
+- `hipErrorNoDevice` / `cudaErrorNoDevice`
+- `NCCL Error 2: unhandled system error` / `NCCL error`
+- Network/DNS errors (DNS resolution, connection refused, timeouts)
+- HuggingFace Hub HTTP errors (502, 503, 504)
 
 ## Performance Considerations
 

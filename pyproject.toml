@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pytest-fkit"
-version = "0.3.4"
-description = "A pytest plugin that prevents crashes from killing your test suite, with execution tracing"
+version = "0.5.0"
+description = "A pytest plugin that prevents crashes from killing your test suite"
 readme = "README.md"
 requires-python = ">=3.8"
 license = {text = "MIT"}
 authors = [
     {name = "Cemberk"}
 ]
-keywords = ["pytest", "testing", "crash", "isolation", "subprocess", "tracing"]
+keywords = ["pytest", "testing", "crash", "isolation", "subprocess"]
 classifiers = [
     "Framework :: Pytest",
     "Programming Language :: Python :: 3",
@@ -33,28 +33,8 @@ Homepage = "https://github.com/Cemberk/pytest-fkit"
 Repository = "https://github.com/Cemberk/pytest-fkit"
 Issues = "https://github.com/Cemberk/pytest-fkit/issues"
 
-[project.optional-dependencies]
-tracer = [
-    "psutil>=5.0.0",
-]
-pysr = [
-    "pysr>=0.16.0",
-    "numpy>=1.20.0",
-    "pandas>=1.3.0",
-]
-all = [
-    "psutil>=5.0.0",
-    "pysr>=0.16.0",
-    "numpy>=1.20.0",
-    "pandas>=1.3.0",
-]
-
-[project.scripts]
-fkit-tracer = "pytest_fkit.tracer.cli:main"
-
 [project.entry-points.pytest11]
 fkit = "pytest_fkit.plugin"
-fkit_tracer = "pytest_fkit.tracer.pytest_plugin"
 
 [tool.setuptools.packages.find]
 where = ["."]
