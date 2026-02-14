@@ -373,6 +373,30 @@ TRANSIENT_ERROR_PATTERNS = [
 ]
 
 
+GPU_TRANSIENT_PATTERNS = [
+    'No HIP GPUs are available',
+    'No CUDA GPUs are available',
+    'RuntimeError: No HIP GPUs',
+    'RuntimeError: No CUDA GPUs',
+    'hipErrorNoDevice',
+    'cudaErrorNoDevice',
+    'CUDA out of memory',
+    'hipErrorOutOfMemory',
+    'NCCL Error 2: unhandled system error',
+    'NCCL error',
+]
+
+
+def _is_gpu_transient_error(result_or_text, stderr: str = "") -> bool:
+    """Detect if a failure is GPU-related and needs a GPU reset before retry."""
+    if isinstance(result_or_text, TestResult):
+        check_text = (result_or_text.longrepr or "") + stderr
+    else:
+        check_text = str(result_or_text) + stderr
+    check_lower = check_text.lower()
+    return any(pattern.lower() in check_lower for pattern in GPU_TRANSIENT_PATTERNS)
+
+
 def _is_transient_error(result_or_text, stderr: str = "") -> bool:
     """Detect if a failure was due to a transient/retryable issue.
     
@@ -932,11 +956,23 @@ class _ScheduledWorkerPool:
             'gpu_errors': 0,
             'retries': 0,
             'workers_failed': 0,
+            'system_resets': 0,
         }
 
         # Control
         self._shutdown = threading.Event()
         self._workers: List[threading.Thread] = []
+
+        # System-wide GPU crash barrier.
+        # When any worker detects a crash, ALL workers must pause for a
+        # coordinated reset of the entire GPU fabric.  A SIGABRT on one
+        # GPU can corrupt the KFD (Kernel Fusion Driver) for ALL GPUs,
+        # so per-worker reset is insufficient.
+        self._crash_barrier_lock = threading.Lock()
+        self._crash_barrier_event = threading.Event()
+        self._crash_barrier_event.set()  # Initially open (no barrier)
+        self._crash_barrier_workers_waiting = 0
+        self._crash_recovery_in_progress = False
 
     # ------------------------------------------------------------------
     # GPU environment (identical for both modes)
@@ -992,6 +1028,88 @@ class _ScheduledWorkerPool:
     # ------------------------------------------------------------------
     # Worker loop (unified — implements the paper's greedy algorithm)
     # ------------------------------------------------------------------
+    # System-wide GPU recovery
+    # ------------------------------------------------------------------
+
+    def _system_gpu_recovery(self, triggering_worker_id: int):
+        """Coordinate a system-wide GPU reset across ALL workers.
+
+        When a test process crashes (SIGABRT/SIGSEGV), the ROCm KFD (Kernel
+        Fusion Driver) can be left in a corrupted state that affects ALL GPUs,
+        not just the one the crashed process was using.  This means a crash on
+        Worker 3 (GPUs 6,7) can cause "No HIP GPUs are available" on Workers
+        using GPUs 0-5.
+
+        This method:
+          1. Raises a barrier so all workers pause before their next test.
+          2. Resets ALL GPUs in the system (not just the crashed worker's).
+          3. Probes ALL GPUs to verify they're back.
+          4. Lowers the barrier so all workers can resume.
+
+        Only one thread runs recovery at a time (the first to acquire the
+        barrier lock); other workers simply wait.
+        """
+        with self._crash_barrier_lock:
+            if self._crash_recovery_in_progress:
+                return  # Another worker is already handling it
+            self._crash_recovery_in_progress = True
+            self._crash_barrier_event.clear()  # Block all workers
+
+        print(f"\n{'='*70}")
+        print(f"   SYSTEM-WIDE GPU RECOVERY (triggered by Worker {triggering_worker_id})")
+        print(f"   Resetting ALL {len(self.gpu_allocations)} GPU groups...")
+        print(f"{'='*70}")
+
+        # Reset ALL GPUs, not just the crashed worker's
+        for wid in range(self.num_workers):
+            gpu_env = self._get_gpu_env_vars(wid)
+            _reset_gpu(gpu_env, self.gpu_vendor)
+
+        # Wait for driver to stabilize
+        time.sleep(8)
+
+        # Probe ALL GPUs
+        recovered = 0
+        failed = 0
+        for wid in range(self.num_workers):
+            if self._worker_states.get(wid) == WorkerState.FAILED:
+                continue  # Already dead, skip
+            gpu_env = self._get_gpu_env_vars(wid)
+            if _gpu_health_probe(gpu_env):
+                self.scheduler.set_worker_health(wid, 'healthy')
+                recovered += 1
+            else:
+                failed += 1
+                # Try once more after additional wait
+                time.sleep(5)
+                if _gpu_health_probe(gpu_env):
+                    self.scheduler.set_worker_health(wid, 'healthy')
+                    recovered += 1
+                    failed -= 1
+                else:
+                    print(f"   ❌ Worker {wid} GPUs unrecoverable after system reset")
+                    self.scheduler.set_worker_health(wid, 'dead')
+                    with self._lock:
+                        self._worker_states[wid] = WorkerState.FAILED
+                        self._stats['workers_failed'] += 1
+
+        with self._lock:
+            self._stats['system_resets'] += 1
+
+        print(f"   System GPU recovery: {recovered} workers recovered, "
+              f"{failed} workers failed")
+        print(f"{'='*70}\n")
+
+        # Lower the barrier — all waiting workers can now resume
+        with self._crash_barrier_lock:
+            self._crash_recovery_in_progress = False
+            self._crash_barrier_event.set()
+
+    def _wait_for_crash_barrier(self):
+        """Block until any in-progress system GPU recovery completes."""
+        self._crash_barrier_event.wait()
+
+    # ------------------------------------------------------------------
 
     def _worker_loop(self, worker_id: int):
         """Worker loop with guaranteed no-drop / no-duplicate semantics.
@@ -1000,14 +1118,21 @@ class _ScheduledWorkerPool:
         is **guaranteed** to be returned — either through ``report_result``
         (normal path) or ``release_work`` (exception / finally path).
 
+        Crash recovery is **system-wide**: a SIGABRT/SIGSEGV on any worker
+        corrupts the KFD (Kernel Fusion Driver) for ALL GPUs.  When a crash
+        is detected, the triggering worker calls ``_system_gpu_recovery``
+        which raises a barrier, resets ALL GPUs, probes ALL workers, and
+        only then lowers the barrier.  Every other worker waits on this
+        barrier before starting its next test.
+
         Flow::
 
-            get_work   → item moves QUEUED → IN_FLIGHT
+            barrier_wait → get_work → IN_FLIGHT
             try:
                 run test
-                report_result → item moves IN_FLIGHT → RESOLVED or QUEUED
+                report_result → RESOLVED or re-QUEUED
             finally:
-                release_work  → if still IN_FLIGHT, moves back to QUEUED
+                release_work  → if still IN_FLIGHT, back to QUEUED
         """
         gpu_env = self._get_gpu_env_vars(worker_id)
         gpu_str = gpu_env.get('FKIT_GPU_IDS', 'N/A')
@@ -1018,6 +1143,17 @@ class _ScheduledWorkerPool:
             self._worker_states[worker_id] = WorkerState.RUNNING
 
         while not self._shutdown.is_set():
+            # --- Barrier: block until any in-progress system GPU recovery
+            #     completes.  This is the synchronisation point that
+            #     prevents workers from launching tests on corrupted GPUs
+            #     while another worker's crash recovery is running.
+            self._wait_for_crash_barrier()
+
+            # After recovery, this worker may have been marked dead.
+            with self._lock:
+                if self._worker_states[worker_id] == WorkerState.FAILED:
+                    break
+
             # --- Pull work from scheduler (QUEUED → IN_FLIGHT) ---
             item = self.scheduler.get_work(worker_id)
             if item is None:
@@ -1033,7 +1169,10 @@ class _ScheduledWorkerPool:
             try:
                 result = self._run_test(item.nodeid, worker_id, gpu_env)
 
-                # Retry transient (non-crash) errors in-place
+                # Retry transient (non-crash) errors in-place.
+                # Between retries, wait on the barrier so that if another
+                # worker crashed (triggering system recovery), we don't
+                # waste retries on a broken GPU fabric.
                 retry_count = 0
                 while (result.outcome == 'failed'
                        and not result.crash
@@ -1045,6 +1184,11 @@ class _ScheduledWorkerPool:
                     print(f"   🔄 Worker {worker_id}: retrying {item.nodeid} "
                           f"(attempt {retry_count + 1}/{self._max_retries + 1}, "
                           f"transient error)")
+                    # Wait for any system recovery before retrying.
+                    self._wait_for_crash_barrier()
+                    with self._lock:
+                        if self._worker_states[worker_id] == WorkerState.FAILED:
+                            break
                     time.sleep(min(2 ** (retry_count - 1), 4))
                     result = self._run_test(item.nodeid, worker_id, gpu_env)
 
@@ -1070,7 +1214,7 @@ class _ScheduledWorkerPool:
                 self.scheduler.report_result(item, result, worker_id)
                 reported = True
 
-                # --- Crash recovery ---
+                # --- Crash recovery (system-wide) ---
                 if result.crash:
                     consecutive_crashes += 1
 
@@ -1084,36 +1228,19 @@ class _ScheduledWorkerPool:
                             self._stats['workers_failed'] += 1
                         break
 
-                    self.scheduler.set_worker_health(worker_id, 'recovering')
-                    print(f"   🔧 Worker {worker_id} (GPUs: {gpu_str}): "
-                          f"crash recovery {consecutive_crashes}/"
-                          f"{max_consecutive_crashes}")
+                    # Trigger system-wide recovery: raises barrier so all
+                    # workers pause, resets ALL GPUs, probes every worker,
+                    # then lowers the barrier.  If another worker already
+                    # started recovery, this is a no-op (returns immediately)
+                    # and we just wait on the barrier at the top of the loop.
+                    self._system_gpu_recovery(worker_id)
 
-                    _reset_gpu(gpu_env, self.gpu_vendor)
-                    time.sleep(5)
-
-                    if _gpu_health_probe(gpu_env):
-                        self.scheduler.set_worker_health(worker_id, 'healthy')
-                        print(f"   ✓  Worker {worker_id}: GPU healthy, "
-                              f"resuming")
-                        continue
-
-                    print(f"   ⚠️  Worker {worker_id}: GPU unhealthy, "
-                          f"extended wait (10s)...")
-                    time.sleep(10)
-
-                    if _gpu_health_probe(gpu_env):
-                        self.scheduler.set_worker_health(worker_id, 'healthy')
-                        print(f"   ✓  Worker {worker_id}: GPU recovered")
-                        continue
-
-                    print(f"   ❌ Worker {worker_id} (GPUs: {gpu_str}): "
-                          f"GPU unrecoverable, disabling")
-                    self.scheduler.set_worker_health(worker_id, 'dead')
+                    # Check if this worker survived the system recovery.
                     with self._lock:
-                        self._worker_states[worker_id] = WorkerState.FAILED
-                        self._stats['workers_failed'] += 1
-                    break
+                        if self._worker_states[worker_id] == WorkerState.FAILED:
+                            break
+
+                    continue
                 else:
                     consecutive_crashes = 0
 
@@ -1624,6 +1751,8 @@ class CrashIsolationPlugin:
             retries = stats.get('retries', 0)
             extra = f" (retries: {retries})" if retries else ""
             print(f"   🎮 GPU errors: {stats['gpu_errors']}{extra}")
+        if stats.get('system_resets', 0) > 0:
+            print(f"   🔄 System-wide GPU resets: {stats['system_resets']}")
         if stats.get('workers_failed', 0) > 0:
             print(f"   ⚠️  Workers disabled: {stats['workers_failed']}")
         print(f"{'='*70}")
