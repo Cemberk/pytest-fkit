@@ -801,6 +801,11 @@ class WorkScheduler:
         with self._lock:
             return self._worker_health.get(worker_id, 'dead')
 
+    def get_in_flight_workers(self) -> set:
+        """Return the set of worker IDs that currently have in-flight tests."""
+        with self._lock:
+            return set(self._in_flight.keys())
+
     def healthy_worker_count(self) -> int:
         with self._lock:
             return sum(1 for h in self._worker_health.values()
@@ -974,6 +979,7 @@ class _ScheduledWorkerPool:
         self._crash_barrier_event.set()  # Initially open (no barrier)
         self._crash_barrier_workers_waiting = 0
         self._crash_recovery_in_progress = False
+        self._last_recovery_time = 0  # epoch timestamp of last recovery
 
     # ------------------------------------------------------------------
     # GPU environment (identical for both modes)
@@ -1044,8 +1050,15 @@ class _ScheduledWorkerPool:
         This method:
           1. Raises a barrier so all workers pause before their next test.
           2. Resets ALL GPUs in the system (not just the crashed worker's).
-          3. Probes ALL GPUs to verify they're back.
-          4. Lowers the barrier so all workers can resume.
+          3. Probes IDLE workers' GPUs to verify they're back.
+          4. Skips in-flight workers (their test subprocesses hold GPU contexts
+             that make probing give false negatives).
+          5. Lowers the barrier so all workers can resume.
+
+        Workers that were in-flight during recovery will finish their current
+        test (which likely crashes due to the GPU reset), return to the top of
+        the loop, and continue normally.  A 30-second cooldown prevents those
+        post-recovery crashes from triggering another full recovery cycle.
 
         Only one thread runs recovery at a time (the first to acquire the
         barrier lock); other workers simply wait.
@@ -1053,6 +1066,12 @@ class _ScheduledWorkerPool:
         with self._crash_barrier_lock:
             if self._crash_recovery_in_progress:
                 return  # Another worker is already handling it
+            # Cooldown: skip if we just recovered.  Workers whose test
+            # subprocesses were interrupted by the previous recovery will
+            # crash and try to trigger recovery again — this prevents
+            # cascading recovery cycles.
+            if time.time() - self._last_recovery_time < 30:
+                return
             self._crash_recovery_in_progress = True
             self._crash_barrier_event.clear()  # Block all workers
 
@@ -1078,17 +1097,30 @@ class _ScheduledWorkerPool:
         else:
             time.sleep(3)  # Brief wait even when no resets worked
 
-        # Probe ALL GPUs in parallel with progressive retry.
-        # Include previously-failed workers — they may have recovered
-        # after this reset cycle.
+        # Identify workers with in-flight tests.  Their test subprocesses
+        # are blocked in subprocess.run() and still hold GPU contexts —
+        # probing those GPUs will give false negatives (probe can't
+        # allocate while the subprocess occupies the device).  Skip them;
+        # they'll finish their current test, return to the barrier
+        # (already lifted by then), and continue normally.
+        in_flight_workers = self.scheduler.get_in_flight_workers()
+
+        # Probe GPUs in parallel with progressive retry.
+        # Include previously-failed workers (they may have recovered),
+        # but exclude in-flight workers (probe would give false negative).
         recovered = 0
         failed = 0
+        skipped_in_flight = 0
 
         workers_to_probe = [
             wid for wid in range(self.num_workers)
-            # Don't skip FAILED workers: re-probe them in case
-            # the system-wide reset brought their GPUs back.
+            if wid not in in_flight_workers
         ]
+        skipped_in_flight = len(in_flight_workers)
+
+        if skipped_in_flight > 0:
+            print(f"   ℹ️  Skipping probe for {skipped_in_flight} workers with "
+                  f"in-flight tests (will resume after current test)")
 
         max_probe_rounds = 3
         probe_delays = [0, 5, 10]  # delay before each round
@@ -1099,10 +1131,12 @@ class _ScheduledWorkerPool:
             if probe_delays[round_idx] > 0:
                 time.sleep(probe_delays[round_idx])
 
-            # Probe all pending workers concurrently
+            # Probe all pending workers concurrently.
+            # Use longer timeout (30s) for post-reset probes — a freshly
+            # reset GPU on a large fabric may need extra driver reinit time.
             def probe_worker(wid):
                 gpu_env = self._get_gpu_env_vars(wid)
-                return wid, _gpu_health_probe(gpu_env)
+                return wid, _gpu_health_probe(gpu_env, timeout=30)
 
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(len(workers_to_probe), 8)
@@ -1123,7 +1157,7 @@ class _ScheduledWorkerPool:
 
             workers_to_probe = still_failing
 
-        # After all rounds, mark remaining as failed
+        # After all rounds, mark remaining probed workers as failed
         for wid in workers_to_probe:
             failed += 1
             print(f"   ❌ Worker {wid} GPUs unrecoverable after {max_probe_rounds} probe rounds")
@@ -1135,12 +1169,13 @@ class _ScheduledWorkerPool:
         with self._lock:
             self._stats['system_resets'] += 1
 
-        print(f"   System GPU recovery: {recovered} workers recovered, "
-              f"{failed} workers failed")
+        print(f"   System GPU recovery: {recovered} recovered, "
+              f"{failed} failed, {skipped_in_flight} in-flight (will resume)")
         print(f"{'='*70}\n")
 
         # Lower the barrier — all waiting workers can now resume
         with self._crash_barrier_lock:
+            self._last_recovery_time = time.time()
             self._crash_recovery_in_progress = False
             self._crash_barrier_event.set()
 
