@@ -599,7 +599,12 @@ def _gpu_health_probe(gpu_env: Dict[str, str], timeout: int = 15) -> bool:
         "    t = torch.zeros(64, device='cuda:0')\n"
         "    torch.cuda.synchronize()\n"
         "    del t\n"
-        "    print(f'probe:ok devices={n}')\n"
+        "    # get_device_capability() uses a different driver code path than\n"
+        "    # tensor allocation.  Production failures showed 'No HIP GPUs\n"
+        "    # are available' at get_device_capability() even though tensor\n"
+        "    # ops succeeded.  This catches that case.\n"
+        "    major, minor = torch.cuda.get_device_capability(0)\n"
+        "    print(f'probe:ok devices={n} cap={major}.{minor}')\n"
         "    sys.exit(0)\n"
         "except Exception as e:\n"
         "    print(f'probe:error {e}')\n"
@@ -980,6 +985,7 @@ class _ScheduledWorkerPool:
         self._crash_barrier_workers_waiting = 0
         self._crash_recovery_in_progress = False
         self._last_recovery_time = 0  # epoch timestamp of last recovery
+        self._recovery_epoch = 0      # monotonic counter, bumped after each recovery
 
     # ------------------------------------------------------------------
     # GPU environment (identical for both modes)
@@ -1176,6 +1182,7 @@ class _ScheduledWorkerPool:
         # Lower the barrier — all waiting workers can now resume
         with self._crash_barrier_lock:
             self._last_recovery_time = time.time()
+            self._recovery_epoch += 1
             self._crash_recovery_in_progress = False
             self._crash_barrier_event.set()
 
@@ -1216,12 +1223,26 @@ class _ScheduledWorkerPool:
         with self._lock:
             self._worker_states[worker_id] = WorkerState.RUNNING
 
+        # gpu_verified: True once a test passes (or probe confirms GPU ok).
+        # Reset after every system recovery so we re-verify before running
+        # more tests.  This avoids probing after every skip/failure — only
+        # the FIRST non-pass after startup or recovery triggers a probe.
+        gpu_verified = False
+        last_recovery_epoch = self._recovery_epoch
+
         while not self._shutdown.is_set():
             # --- Barrier: block until any in-progress system GPU recovery
             #     completes.  This is the synchronisation point that
             #     prevents workers from launching tests on corrupted GPUs
             #     while another worker's crash recovery is running.
             self._wait_for_crash_barrier()
+
+            # After recovery, invalidate gpu_verified so the next non-pass
+            # test triggers a fresh GPU probe.
+            with self._lock:
+                if self._recovery_epoch != last_recovery_epoch:
+                    last_recovery_epoch = self._recovery_epoch
+                    gpu_verified = False
 
             # After recovery, check if this worker was marked dead.
             # If system recovery brought the GPU back, resume running.
@@ -1246,6 +1267,42 @@ class _ScheduledWorkerPool:
             reported = False
             try:
                 result = self._run_test(item.nodeid, worker_id, gpu_env)
+
+                # --- Probe-based GPU health verification ---
+                # Instead of parsing error strings, actually probe the GPU
+                # after non-pass results.  This catches ALL failure modes:
+                # "No HIP GPUs", "test requires accelerator" skips, NCCL
+                # errors, OOM, etc. — anything that leaves the GPU broken.
+                #
+                # Only probe when gpu_verified is False (first test after
+                # startup or recovery).  Once verified, trust it until the
+                # next recovery event.
+                if result.outcome == 'passed':
+                    gpu_verified = True
+                elif (not result.crash
+                      and not gpu_verified
+                      and result.outcome in ('failed', 'skipped')):
+                    if not _gpu_health_probe(gpu_env, timeout=10):
+                        # GPU is genuinely dead — re-queue test, recover.
+                        print(f"   ⚠️  Worker {worker_id} (GPUs: {gpu_str}): "
+                              f"GPU probe failed after {result.outcome}, "
+                              f"re-queuing {item.nodeid}")
+                        self.scheduler.set_worker_health(worker_id, 'dead')
+                        with self._lock:
+                            self._worker_states[worker_id] = WorkerState.FAILED
+                            self._stats['gpu_errors'] += 1
+                        self._system_gpu_recovery(worker_id)
+                        with self._lock:
+                            if self._worker_states[worker_id] == WorkerState.FAILED:
+                                if self.scheduler.get_worker_health(worker_id) == 'healthy':
+                                    self._worker_states[worker_id] = WorkerState.RUNNING
+                                    gpu_verified = True
+                                else:
+                                    break
+                        continue
+                    else:
+                        # GPU is fine — genuine test failure/skip.
+                        gpu_verified = True
 
                 # Retry transient (non-crash) errors in-place.
                 # Between retries, wait on the barrier so that if another
