@@ -31,6 +31,7 @@ import queue
 import re
 import json
 import shutil
+import concurrent.futures
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from dataclasses import dataclass, field
@@ -1060,38 +1061,76 @@ class _ScheduledWorkerPool:
         print(f"   Resetting ALL {len(self.gpu_allocations)} GPU groups...")
         print(f"{'='*70}")
 
-        # Reset ALL GPUs, not just the crashed worker's
-        for wid in range(self.num_workers):
-            gpu_env = self._get_gpu_env_vars(wid)
-            _reset_gpu(gpu_env, self.gpu_vendor)
-
-        # Wait for driver to stabilize
-        time.sleep(8)
-
-        # Probe ALL GPUs
-        recovered = 0
-        failed = 0
+        # Reset ALL GPUs, track which succeeded
+        reset_ok = {}
         for wid in range(self.num_workers):
             if self._worker_states.get(wid) == WorkerState.FAILED:
-                continue  # Already dead, skip
+                reset_ok[wid] = False
+                continue
             gpu_env = self._get_gpu_env_vars(wid)
-            if _gpu_health_probe(gpu_env):
-                self.scheduler.set_worker_health(wid, 'healthy')
-                recovered += 1
-            else:
-                failed += 1
-                # Try once more after additional wait
-                time.sleep(5)
-                if _gpu_health_probe(gpu_env):
+            reset_ok[wid] = _reset_gpu(gpu_env, self.gpu_vendor)
+
+        # Scale wait time to GPU fabric size
+        any_reset_succeeded = any(reset_ok.values())
+        if any_reset_succeeded:
+            base_wait = min(max(8, 2 * self.num_workers), 30)
+            time.sleep(base_wait)
+        else:
+            time.sleep(3)  # Brief wait even when no resets worked
+
+        # Probe ALL GPUs in parallel with progressive retry.
+        # Include previously-failed workers — they may have recovered
+        # after this reset cycle.
+        recovered = 0
+        failed = 0
+
+        workers_to_probe = [
+            wid for wid in range(self.num_workers)
+            # Don't skip FAILED workers: re-probe them in case
+            # the system-wide reset brought their GPUs back.
+        ]
+
+        max_probe_rounds = 3
+        probe_delays = [0, 5, 10]  # delay before each round
+
+        for round_idx in range(max_probe_rounds):
+            if not workers_to_probe:
+                break
+            if probe_delays[round_idx] > 0:
+                time.sleep(probe_delays[round_idx])
+
+            # Probe all pending workers concurrently
+            def probe_worker(wid):
+                gpu_env = self._get_gpu_env_vars(wid)
+                return wid, _gpu_health_probe(gpu_env)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(len(workers_to_probe), 8)
+            ) as executor:
+                results = list(executor.map(probe_worker, workers_to_probe))
+
+            still_failing = []
+            for wid, healthy in results:
+                if healthy:
                     self.scheduler.set_worker_health(wid, 'healthy')
-                    recovered += 1
-                    failed -= 1
-                else:
-                    print(f"   ❌ Worker {wid} GPUs unrecoverable after system reset")
-                    self.scheduler.set_worker_health(wid, 'dead')
+                    # Restore previously-failed workers
                     with self._lock:
-                        self._worker_states[wid] = WorkerState.FAILED
-                        self._stats['workers_failed'] += 1
+                        if self._worker_states.get(wid) == WorkerState.FAILED:
+                            self._worker_states[wid] = WorkerState.RUNNING
+                    recovered += 1
+                else:
+                    still_failing.append(wid)
+
+            workers_to_probe = still_failing
+
+        # After all rounds, mark remaining as failed
+        for wid in workers_to_probe:
+            failed += 1
+            print(f"   ❌ Worker {wid} GPUs unrecoverable after {max_probe_rounds} probe rounds")
+            self.scheduler.set_worker_health(wid, 'dead')
+            with self._lock:
+                self._worker_states[wid] = WorkerState.FAILED
+                self._stats['workers_failed'] += 1
 
         with self._lock:
             self._stats['system_resets'] += 1
@@ -1149,10 +1188,14 @@ class _ScheduledWorkerPool:
             #     while another worker's crash recovery is running.
             self._wait_for_crash_barrier()
 
-            # After recovery, this worker may have been marked dead.
+            # After recovery, check if this worker was marked dead.
+            # If system recovery brought the GPU back, resume running.
             with self._lock:
                 if self._worker_states[worker_id] == WorkerState.FAILED:
-                    break
+                    if self.scheduler.get_worker_health(worker_id) == 'healthy':
+                        self._worker_states[worker_id] = WorkerState.RUNNING
+                    else:
+                        break
 
             # --- Pull work from scheduler (QUEUED → IN_FLIGHT) ---
             item = self.scheduler.get_work(worker_id)
@@ -1188,7 +1231,10 @@ class _ScheduledWorkerPool:
                     self._wait_for_crash_barrier()
                     with self._lock:
                         if self._worker_states[worker_id] == WorkerState.FAILED:
-                            break
+                            if self.scheduler.get_worker_health(worker_id) == 'healthy':
+                                self._worker_states[worker_id] = WorkerState.RUNNING
+                            else:
+                                break
                     time.sleep(min(2 ** (retry_count - 1), 4))
                     result = self._run_test(item.nodeid, worker_id, gpu_env)
 
@@ -1238,7 +1284,10 @@ class _ScheduledWorkerPool:
                     # Check if this worker survived the system recovery.
                     with self._lock:
                         if self._worker_states[worker_id] == WorkerState.FAILED:
-                            break
+                            if self.scheduler.get_worker_health(worker_id) == 'healthy':
+                                self._worker_states[worker_id] = WorkerState.RUNNING
+                            else:
+                                break
 
                     continue
                 else:
