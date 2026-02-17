@@ -1069,9 +1069,11 @@ class _ScheduledWorkerPool:
           HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
           CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
 
-        NCCL/RCCL per-worker isolation:
-          Each worker gets a unique MASTER_PORT so that DataParallel /
+        NCCL/RCCL per-worker isolation (multi-GPU workers only):
+          Workers with >1 GPU get a unique MASTER_PORT so that DataParallel /
           DistributedDataParallel tests in different workers don't collide.
+          Single-GPU workers do NOT get MASTER_ADDR/MASTER_PORT to avoid
+          RCCL auto-initialization on AMD ROCm ("NCCL Error 2").
         """
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
 
@@ -1084,15 +1086,12 @@ class _ScheduledWorkerPool:
             'TORCH_NUM_THREADS': str(self.threads_per_worker),
             'FKIT_WORKER_ID': str(worker_id),
             'FKIT_THREADS': str(self.threads_per_worker),
-            'MASTER_PORT': str(NCCL_BASE_PORT + worker_id),
-            'NCCL_ASYNC_ERROR_HANDLING': '1',
-            'NCCL_SOCKET_IFNAME': 'lo',
         }
 
         if gpu_ids:
+            num_gpus = len(gpu_ids.split(','))
             if self.gpu_vendor == 'amd':
                 env_vars['ROCR_VISIBLE_DEVICES'] = gpu_ids
-                num_gpus = len(gpu_ids.split(','))
                 hip_ids = ','.join(str(i) for i in range(num_gpus))
                 env_vars['HIP_VISIBLE_DEVICES'] = hip_ids
                 env_vars['CUDA_VISIBLE_DEVICES'] = hip_ids
@@ -1100,6 +1099,17 @@ class _ScheduledWorkerPool:
                 env_vars['CUDA_VISIBLE_DEVICES'] = gpu_ids
             env_vars['FKIT_WORKER_ID'] = str(worker_id)
             env_vars['FKIT_GPU_IDS'] = gpu_ids
+
+            # Only set NCCL/RCCL distributed env vars when worker has
+            # multiple GPUs (needed for DataParallel/DDP tests).
+            # For single-GPU workers, MASTER_PORT and MASTER_ADDR can
+            # cause RCCL auto-initialization on AMD ROCm, leading to
+            # "NCCL Error 2: unhandled system error" during simple
+            # operations like model.to("cuda").
+            if num_gpus > 1:
+                env_vars['MASTER_PORT'] = str(NCCL_BASE_PORT + worker_id)
+                env_vars['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+                env_vars['NCCL_SOCKET_IFNAME'] = 'lo'
 
         return env_vars
 
@@ -1495,13 +1505,19 @@ class _ScheduledWorkerPool:
             # inherits the parent's FULL environment (conda, venv, pyenv,
             # Docker, etc.) instead of a reconstructed copy which can
             # silently lose variables needed for package resolution.
+            #
+            # Only set distributed env
+            # vars (MASTER_ADDR/MASTER_PORT) if the worker has multiple
+            # GPUs.  On AMD ROCm, RCCL auto-probes when these are present,
+            # causing "NCCL Error 2: unhandled system error" even in
+            # single-GPU tests that never call init_process_group().
             env_overrides = dict(gpu_env)
-            if 'NCCL_ASYNC_ERROR_HANDLING' not in os.environ:
-                env_overrides['NCCL_ASYNC_ERROR_HANDLING'] = '1'
-            if 'MASTER_ADDR' not in os.environ:
-                env_overrides['MASTER_ADDR'] = '127.0.0.1'
-            env_overrides.setdefault(
-                'MASTER_PORT', str(NCCL_BASE_PORT + worker_id))
+            if 'MASTER_PORT' in gpu_env:
+                # Multi-GPU worker — needs NCCL/RCCL for DataParallel/DDP
+                if 'NCCL_ASYNC_ERROR_HANDLING' not in os.environ:
+                    env_overrides['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+                if 'MASTER_ADDR' not in os.environ:
+                    env_overrides['MASTER_ADDR'] = '127.0.0.1'
 
             pytest_cmd = [
                 sys.executable, '-m', 'pytest',
@@ -1805,8 +1821,13 @@ class CrashIsolationPlugin:
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
-            print(f"   NCCL ports: {NCCL_BASE_PORT}-{NCCL_BASE_PORT + self.num_workers - 1} "
-                  f"(per-worker isolation)")
+            multi_gpu_workers = sum(1 for alloc in self.gpu_allocations
+                                    if len(alloc.split(',')) > 1)
+            if multi_gpu_workers > 0:
+                print(f"   NCCL ports: {NCCL_BASE_PORT}-{NCCL_BASE_PORT + self.num_workers - 1} "
+                      f"(multi-GPU workers only: {multi_gpu_workers}/{self.num_workers})")
+            else:
+                print(f"   NCCL ports: not set (all workers are single-GPU)")
             print(f"   Crash recovery: GPU health probe + 5-15s cooldown + auto-redistribute")
             print(f"   Python: {sys.executable} (subprocess tests will use this binary)")
             # GPU preflight: verify each worker can see its GPU from a subprocess
