@@ -235,6 +235,26 @@ def detect_gpus() -> GPUInfo:
                         gpu_ids = [str(i) for i in range(gpu_count)]
             
             if gpu_ids:
+                # Validate against PyTorch device count — rocm-smi --showid
+                # can report GCD entries (Graphics Compute Dies) instead of
+                # physical GPUs.  On MI300X this gives 40 instead of 8.
+                try:
+                    result_torch = subprocess.run(
+                        [sys.executable, '-c',
+                         'import torch; print(torch.cuda.device_count())'],
+                        capture_output=True, text=True, timeout=15
+                    )
+                    if result_torch.returncode == 0:
+                        torch_count = int(result_torch.stdout.strip())
+                        if 0 < torch_count < len(gpu_ids):
+                            print(f"[fkit] WARNING: rocm-smi reported "
+                                  f"{len(gpu_ids)} GPUs but PyTorch sees "
+                                  f"{torch_count}. Using PyTorch count "
+                                  f"(rocm-smi likely counted GCDs).")
+                            gpu_ids = [str(i) for i in range(torch_count)]
+                except Exception:
+                    pass
+
                 print(f"[fkit] GPU detection: rocm-smi found {len(gpu_ids)} GPUs")
                 return GPUInfo(count=len(gpu_ids), vendor='amd', ids=gpu_ids)
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -937,7 +957,8 @@ class _ScheduledWorkerPool:
 
     def __init__(self, num_workers: int, gpu_allocations: List[str],
                  gpu_vendor: str, timeout: int, result_callback: Callable,
-                 threads_per_worker: int = 4, max_retries: int = 3):
+                 threads_per_worker: int = 4, max_retries: int = 3,
+                 dead_workers=None):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
@@ -954,6 +975,18 @@ class _ScheduledWorkerPool:
 
         # Worker state tracking
         self._worker_states = {i: WorkerState.IDLE for i in range(num_workers)}
+
+        # Apply preflight dead workers — exclude from scheduling immediately.
+        # These workers had dead GPUs at startup (detected by _gpu_preflight)
+        # and recovery failed.  Without this, they'd each get a test, fail,
+        # trigger system-wide recovery, and cascade across all dead workers.
+        if dead_workers:
+            for wid in dead_workers:
+                if wid < num_workers:
+                    self.scheduler.set_worker_health(wid, 'dead')
+                    self._worker_states[wid] = WorkerState.FAILED
+            print(f"   ℹ️  {len(dead_workers)} workers excluded by preflight: "
+                  f"{sorted(dead_workers)}")
 
         # Execution-level statistics (counts every attempt, not just terminals)
         self._lock = threading.Lock()
@@ -1221,6 +1254,12 @@ class _ScheduledWorkerPool:
         consecutive_crashes = 0
 
         with self._lock:
+            # If this worker was pre-marked dead by preflight, exit immediately.
+            # Without this guard, the thread would overwrite FAILED → RUNNING
+            # and spin in the get_work loop (scheduler blocks dead workers but
+            # the thread would waste resources until shutdown).
+            if self._worker_states[worker_id] == WorkerState.FAILED:
+                return
             self._worker_states[worker_id] = WorkerState.RUNNING
 
         # gpu_verified: True once a test passes (or probe confirms GPU ok).
@@ -1735,7 +1774,47 @@ class CrashIsolationPlugin:
                   f"(per-worker isolation)")
             print(f"   Crash recovery: GPU health probe + 5-15s cooldown + auto-redistribute")
             # GPU preflight: verify each worker can see its GPU from a subprocess
-            self._gpu_preflight()
+            preflight = self._gpu_preflight()
+            failed_workers = [w for w, ok in preflight.items() if not ok]
+
+            if failed_workers:
+                print(f"\n   ⚠️  {len(failed_workers)}/{self.num_workers} workers "
+                      f"failed GPU preflight: {sorted(failed_workers)}")
+
+                # Attempt ONE recovery: reset failed GPUs, wait, re-probe
+                print(f"   🔄 Attempting startup GPU recovery...")
+                for w in failed_workers:
+                    gpu_vars = self._build_gpu_env(w)
+                    _reset_gpu(gpu_vars, self.gpu_info.vendor)
+                wait_time = min(max(8, 2 * len(failed_workers)), 30)
+                print(f"   ⏳ Waiting {wait_time}s for GPU driver re-initialization...")
+                time.sleep(wait_time)
+
+                # Re-probe failed workers after recovery
+                still_dead = []
+                for w in failed_workers:
+                    gpu_vars = self._build_gpu_env(w)
+                    if _gpu_health_probe(gpu_vars, timeout=30):
+                        print(f"   ✓  Worker {w} recovered after GPU reset")
+                    else:
+                        still_dead.append(w)
+                        print(f"   ❌ Worker {w} still dead after recovery attempt")
+
+                self._preflight_dead_workers = set(still_dead)
+
+                if still_dead:
+                    healthy_count = self.num_workers - len(still_dead)
+                    if healthy_count == 0:
+                        raise RuntimeError(
+                            f"FATAL: ALL {self.num_workers} workers failed GPU "
+                            f"preflight and recovery. No healthy GPUs available. "
+                            f"Check GPU hardware, driver, and container config.")
+                    print(f"   ℹ️  Continuing with {healthy_count}/{self.num_workers} "
+                          f"healthy workers ({len(still_dead)} excluded)")
+                else:
+                    print(f"   ✓  All {len(failed_workers)} workers recovered")
+            else:
+                self._preflight_dead_workers = set()
         else:
             print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
                   f"{self.threads_per_worker} CPU threads/worker (no GPU detected)")
@@ -1743,13 +1822,36 @@ class CrashIsolationPlugin:
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
     
-    def _gpu_preflight(self):
+    def _build_gpu_env(self, worker_id: int) -> Dict[str, str]:
+        """Build GPU environment variables for a worker.
+
+        Same mapping as ``_ScheduledWorkerPool._get_gpu_env_vars`` but usable
+        before the worker pool exists (during preflight / startup recovery).
+        """
+        gpu_env_str = self.gpu_allocations[worker_id]
+        env = {}
+        if not gpu_env_str:
+            return env
+        if self.gpu_info.vendor == 'amd':
+            num = len(gpu_env_str.split(','))
+            hip_ids = ','.join(str(i) for i in range(num))
+            env['ROCR_VISIBLE_DEVICES'] = gpu_env_str
+            env['HIP_VISIBLE_DEVICES'] = hip_ids
+            env['CUDA_VISIBLE_DEVICES'] = hip_ids
+        elif self.gpu_info.vendor == 'nvidia':
+            env['CUDA_VISIBLE_DEVICES'] = gpu_env_str
+        env['FKIT_GPU_IDS'] = gpu_env_str
+        return env
+
+    def _gpu_preflight(self) -> Dict[int, bool]:
         """Verify each worker can see its GPU from a subprocess.
 
         Spawns a tiny Python process per worker with the exact same env that
         _run_test would use.  Checks /dev/kfd, /dev/dri/renderD*, and
         torch.cuda.is_available().  Failures here surface the root cause
         immediately instead of manifesting as hundreds of mysterious skips.
+
+        Returns a dict mapping worker_id → bool (True = GPU healthy).
         """
         probe_script = (
             "import os, sys, glob\n"
@@ -1768,21 +1870,14 @@ class CrashIsolationPlugin:
             "      f'ROCR={rocr} HIP={hip} CUDA={cuda}')\n"
             "sys.exit(0 if avail else 1)\n"
         )
-        all_ok = True
+        results = {}
         for w in range(min(self.num_workers, len(self.gpu_allocations))):
             env = os.environ.copy()
-            gpu_env = self.gpu_allocations[w]
-            if not gpu_env:
+            gpu_vars = self._build_gpu_env(w)
+            if not gpu_vars:
+                results[w] = True
                 continue
-            # Build env exactly like _run_test would
-            if self.gpu_info.vendor == 'amd':
-                num = len(gpu_env.split(','))
-                hip_ids = ','.join(str(i) for i in range(num))
-                env['ROCR_VISIBLE_DEVICES'] = gpu_env
-                env['HIP_VISIBLE_DEVICES'] = hip_ids
-                env['CUDA_VISIBLE_DEVICES'] = hip_ids
-            elif self.gpu_info.vendor == 'nvidia':
-                env['CUDA_VISIBLE_DEVICES'] = gpu_env
+            env.update(gpu_vars)
             try:
                 r = subprocess.run(
                     [sys.executable, '-c', probe_script],
@@ -1790,19 +1885,18 @@ class CrashIsolationPlugin:
                 )
                 line = (r.stdout.strip().split('\n') or [''])[-1]
                 if r.returncode != 0:
-                    all_ok = False
+                    results[w] = False
                     print(f"   ⚠️  Worker {w} GPU PREFLIGHT FAILED: {line}")
                     if r.stderr.strip():
                         for s in r.stderr.strip().split('\n')[-3:]:
                             print(f"       {s}")
                 else:
+                    results[w] = True
                     print(f"   ✓  Worker {w} GPU OK: {line}")
             except Exception as e:
-                all_ok = False
+                results[w] = False
                 print(f"   ⚠️  Worker {w} GPU preflight error: {e}")
-        if not all_ok:
-            print("   ⚠️  Some workers cannot see their GPU – tests may skip "
-                  "with 'test requires accelerator'")
+        return results
 
     def _result_callback(self, item, result: TestResult):
         """Callback for when a test completes."""
@@ -1827,11 +1921,17 @@ class CrashIsolationPlugin:
             return None
         
         # Choose worker pool based on execution mode
+        dead_workers = getattr(self, '_preflight_dead_workers', None)
+        dead_count = len(dead_workers) if dead_workers else 0
+        effective_workers = self.num_workers - dead_count
+        extra = f" ({dead_count} excluded by preflight)" if dead_count else ""
+
         if self.execution_mode == 'batch':
             # Sliced mode: tests are pre-distributed to workers
-            print(f"\n🔄 Running {len(self._collected_items)} tests across {self.num_workers} workers "
-                  f"(sliced scheduling - each worker gets 1/{self.num_workers} of tests)...\n")
-            
+            print(f"\n🔄 Running {len(self._collected_items)} tests across "
+                  f"{effective_workers} workers{extra} "
+                  f"(sliced scheduling)...\n")
+
             self.worker_pool = SlicedWorkerPool(
                 num_workers=self.num_workers,
                 gpu_allocations=self.gpu_allocations,
@@ -1840,12 +1940,14 @@ class CrashIsolationPlugin:
                 result_callback=self._result_callback,
                 threads_per_worker=self.threads_per_worker,
                 max_retries=self.max_retries,
+                dead_workers=dead_workers,
             )
         else:
             # Dynamic mode: tests are assigned to workers on-demand
-            print(f"\n🔄 Running {len(self._collected_items)} tests across {self.num_workers} workers "
+            print(f"\n🔄 Running {len(self._collected_items)} tests across "
+                  f"{effective_workers} workers{extra} "
                   f"(dynamic scheduling)...\n")
-            
+
             self.worker_pool = DynamicWorkerPool(
                 num_workers=self.num_workers,
                 gpu_allocations=self.gpu_allocations,
@@ -1854,6 +1956,7 @@ class CrashIsolationPlugin:
                 result_callback=self._result_callback,
                 threads_per_worker=self.threads_per_worker,
                 max_retries=self.max_retries,
+                dead_workers=dead_workers,
             )
         
         # Submit all tests (sliced or queued depending on pool type)
