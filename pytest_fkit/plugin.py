@@ -595,6 +595,39 @@ def _filter_stderr(stderr: str) -> str:
     return result
 
 
+def _build_inherited_env_cmd(
+        env_overrides: Dict[str, str],
+        base_cmd: List[str],
+) -> List[str]:
+    """Build a command that inherits the parent's full environment and only
+    overrides the specified variables.
+
+    Instead of ``subprocess.run(cmd, env=os.environ.copy() + overrides)``
+    (which constructs a *replacement* dict and risks losing variables that
+    the Docker/conda/venv/pyenv environment injected), we prepend the
+    ``env`` command so the child inherits the parent's real environment and
+    only the listed variables are added or replaced.
+
+    Example::
+
+        _build_inherited_env_cmd(
+            {'ROCR_VISIBLE_DEVICES': '3', 'HIP_VISIBLE_DEVICES': '0'},
+            ['python', '-m', 'pytest', 'test_foo.py'],
+        )
+        # → ['env', 'ROCR_VISIBLE_DEVICES=3', 'HIP_VISIBLE_DEVICES=0',
+        #    'python', '-m', 'pytest', 'test_foo.py']
+
+    The resulting command should be passed to ``subprocess.run()`` **without**
+    an ``env=`` keyword so that the child inherits the parent process's
+    environment verbatim.
+    """
+    cmd = ['env']
+    for key, value in env_overrides.items():
+        cmd.append(f'{key}={value}')
+    cmd.extend(base_cmd)
+    return cmd
+
+
 def _gpu_health_probe(gpu_env: Dict[str, str], timeout: int = 15) -> bool:
     """Probe GPU health by spawning a subprocess that actually allocates a tensor.
 
@@ -630,12 +663,11 @@ def _gpu_health_probe(gpu_env: Dict[str, str], timeout: int = 15) -> bool:
         "    print(f'probe:error {e}')\n"
         "    sys.exit(1)\n"
     )
-    env = os.environ.copy()
-    env.update(gpu_env)
     try:
+        cmd = _build_inherited_env_cmd(
+            gpu_env, [sys.executable, '-c', probe_script])
         r = subprocess.run(
-            [sys.executable, '-c', probe_script],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            cmd, capture_output=True, text=True, timeout=timeout,
         )
         output = (r.stdout.strip().split('\n') or [''])[-1]
         if r.returncode == 0 and 'probe:ok' in output:
@@ -1458,17 +1490,18 @@ class _ScheduledWorkerPool:
         try:
             start_time = time.time()
 
-            env = os.environ.copy()
-            env.update(gpu_env)
-            env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
-            env.setdefault('MASTER_ADDR', '127.0.0.1')
-            env.setdefault('MASTER_PORT', str(NCCL_BASE_PORT + worker_id))
-
-            for var in ('HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
-                        'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
-                        'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE'):
-                if var in os.environ:
-                    env[var] = os.environ[var]
+            # Build per-worker env overrides (GPU vars, NCCL, threads).
+            # These are injected via the `env` command so the subprocess
+            # inherits the parent's FULL environment (conda, venv, pyenv,
+            # Docker, etc.) instead of a reconstructed copy which can
+            # silently lose variables needed for package resolution.
+            env_overrides = dict(gpu_env)
+            if 'NCCL_ASYNC_ERROR_HANDLING' not in os.environ:
+                env_overrides['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+            if 'MASTER_ADDR' not in os.environ:
+                env_overrides['MASTER_ADDR'] = '127.0.0.1'
+            env_overrides.setdefault(
+                'MASTER_PORT', str(NCCL_BASE_PORT + worker_id))
 
             pytest_cmd = [
                 sys.executable, '-m', 'pytest',
@@ -1479,10 +1512,12 @@ class _ScheduledWorkerPool:
                 f'--junitxml={junit_path}',
             ]
 
+            cmd = _build_inherited_env_cmd(env_overrides, pytest_cmd)
+
             try:
                 proc = subprocess.run(
-                    pytest_cmd, capture_output=True, text=True,
-                    timeout=self.timeout, cwd=str(Path.cwd()), env=env,
+                    cmd, capture_output=True, text=True,
+                    timeout=self.timeout, cwd=str(Path.cwd()),
                 )
 
                 duration = time.time() - start_time
@@ -1773,6 +1808,7 @@ class CrashIsolationPlugin:
             print(f"   NCCL ports: {NCCL_BASE_PORT}-{NCCL_BASE_PORT + self.num_workers - 1} "
                   f"(per-worker isolation)")
             print(f"   Crash recovery: GPU health probe + 5-15s cooldown + auto-redistribute")
+            print(f"   Python: {sys.executable} (subprocess tests will use this binary)")
             # GPU preflight: verify each worker can see its GPU from a subprocess
             preflight = self._gpu_preflight()
             failed_workers = [w for w, ok in preflight.items() if not ok]
@@ -1815,6 +1851,10 @@ class CrashIsolationPlugin:
                     print(f"   ✓  All {len(failed_workers)} workers recovered")
             else:
                 self._preflight_dead_workers = set()
+
+            # Environment parity check: verify subprocess can find
+            # the same packages as the parent process
+            self._env_parity_check()
         else:
             print(f"\n🚀 pytest-fkit: {self.num_workers} workers, "
                   f"{self.threads_per_worker} CPU threads/worker (no GPU detected)")
@@ -1842,6 +1882,65 @@ class CrashIsolationPlugin:
             env['CUDA_VISIBLE_DEVICES'] = gpu_env_str
         env['FKIT_GPU_IDS'] = gpu_env_str
         return env
+
+    def _env_parity_check(self):
+        """Verify subprocess inherits the parent's Python environment.
+
+        Spawns a single subprocess (using the same ``env`` command mechanism
+        as ``_run_test``) and checks that ``importlib.util.find_spec()``
+        returns the same results as the parent.  This catches cases where
+        conda/venv/Docker environment variables are lost during subprocess
+        creation, causing installed packages to become invisible.
+        """
+        import importlib.util as ilu
+        # Check packages commonly used by HuggingFace test decorators
+        check_pkgs = [
+            'torch', 'transformers', 'accelerate', 'flash_attn',
+            'bitsandbytes', 'deepspeed', 'datasets', 'tokenizers',
+            'safetensors',
+        ]
+        parent_found = {p: ilu.find_spec(p) is not None for p in check_pkgs}
+
+        script = (
+            "import importlib.util, json, sys\n"
+            "pkgs = " + repr(check_pkgs) + "\n"
+            "result = {p: importlib.util.find_spec(p) is not None for p in pkgs}\n"
+            "result['_sys_executable'] = sys.executable\n"
+            "print(json.dumps(result))\n"
+        )
+
+        gpu_vars = self._build_gpu_env(0)
+        cmd = _build_inherited_env_cmd(
+            gpu_vars, [sys.executable, '-c', script])
+        try:
+            r = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=15,
+            )
+            if r.returncode != 0:
+                print(f"   ⚠️  Env parity check failed to run: {r.stderr.strip()[:200]}")
+                return
+
+            import json
+            child = json.loads(r.stdout.strip())
+            child_exe = child.pop('_sys_executable', '?')
+
+            diverged = []
+            for pkg in check_pkgs:
+                if parent_found[pkg] and not child.get(pkg, False):
+                    diverged.append(pkg)
+
+            if diverged:
+                print(f"   ⚠️  ENV PARITY WARNING: {len(diverged)} packages found in "
+                      f"parent but MISSING in subprocess: {diverged}")
+                print(f"       Parent Python:     {sys.executable}")
+                print(f"       Subprocess Python: {child_exe}")
+                print(f"       This means tests using @require_{diverged[0]} "
+                      f"will SKIP in fkit mode but would RUN without fkit.")
+            else:
+                installed = [p for p in check_pkgs if parent_found[p]]
+                print(f"   ✓  Env parity OK: subprocess finds same {len(installed)} packages")
+        except Exception as e:
+            print(f"   ⚠️  Env parity check error: {e}")
 
     def _gpu_preflight(self) -> Dict[int, bool]:
         """Verify each worker can see its GPU from a subprocess.
@@ -1872,16 +1971,15 @@ class CrashIsolationPlugin:
         )
         results = {}
         for w in range(min(self.num_workers, len(self.gpu_allocations))):
-            env = os.environ.copy()
             gpu_vars = self._build_gpu_env(w)
             if not gpu_vars:
                 results[w] = True
                 continue
-            env.update(gpu_vars)
             try:
+                cmd = _build_inherited_env_cmd(
+                    gpu_vars, [sys.executable, '-c', probe_script])
                 r = subprocess.run(
-                    [sys.executable, '-c', probe_script],
-                    capture_output=True, text=True, timeout=30, env=env
+                    cmd, capture_output=True, text=True, timeout=30,
                 )
                 line = (r.stdout.strip().split('\n') or [''])[-1]
                 if r.returncode != 0:

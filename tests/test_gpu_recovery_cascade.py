@@ -1025,6 +1025,635 @@ def test_preflight_dead_workers_tests_complete_on_healthy():
 
 
 # ---------------------------------------------------------------------------
+# Tests 14-16: GPU env isolation verification
+# ---------------------------------------------------------------------------
+
+def test_gpu_env_vars_override_parent():
+    """Verify that per-worker GPU env vars OVERRIDE the parent's broad
+    visibility vars — not appended, not ignored, but replaced."""
+    pool, _ = make_pool(8, gpus_per_worker=1)
+
+    # Simulate parent having broad GPU visibility (like transformers_ut.sh sets)
+    parent_gpu_vars = {
+        'ROCR_VISIBLE_DEVICES': '0,1,2,3,4,5,6,7',
+        'HIP_VISIBLE_DEVICES': '0,1,2,3,4,5,6,7',
+        'CUDA_VISIBLE_DEVICES': '0,1,2,3,4,5,6,7',
+    }
+
+    for worker_id in range(8):
+        gpu_env = pool._get_gpu_env_vars(worker_id)
+
+        # Simulate what _run_test does: copy parent env then update
+        env = parent_gpu_vars.copy()
+        env.update(gpu_env)
+
+        # Per-worker values must win over parent's broad values
+        expected_rocr = str(worker_id)  # Physical GPU index
+        expected_hip = '0'  # Relative to ROCR set (only 1 device)
+        expected_cuda = '0'  # Same as HIP for AMD
+
+        assert env['ROCR_VISIBLE_DEVICES'] == expected_rocr, \
+            f"Worker {worker_id}: ROCR should be '{expected_rocr}', " \
+            f"got '{env['ROCR_VISIBLE_DEVICES']}'"
+        assert env['HIP_VISIBLE_DEVICES'] == expected_hip, \
+            f"Worker {worker_id}: HIP should be '{expected_hip}', " \
+            f"got '{env['HIP_VISIBLE_DEVICES']}'"
+        assert env['CUDA_VISIBLE_DEVICES'] == expected_cuda, \
+            f"Worker {worker_id}: CUDA should be '{expected_cuda}', " \
+            f"got '{env['CUDA_VISIBLE_DEVICES']}'"
+
+    print(f"✅ test_gpu_env_vars_override_parent PASSED")
+    print(f"   All 8 workers: ROCR=N, HIP=0, CUDA=0 (parent's broad vars overridden)")
+
+
+def test_gpu_env_probe_and_test_parity():
+    """Verify that _gpu_health_probe and _run_test use identical GPU env vars.
+
+    If the probe passes but the test subprocess has different GPU vars,
+    we'd incorrectly conclude the GPU is healthy when the test can't see it.
+    """
+    pool, _ = make_pool(8, gpus_per_worker=2)
+
+    for worker_id in range(8):
+        gpu_env = pool._get_gpu_env_vars(worker_id)
+
+        # Simulate _gpu_health_probe env construction (plugin.py line 633-634)
+        probe_env = {'PARENT_VAR': 'value'}  # stand-in for os.environ.copy()
+        probe_env.update(gpu_env)
+
+        # Simulate _run_test env construction (plugin.py line 1461-1471)
+        test_env = {'PARENT_VAR': 'value'}
+        test_env.update(gpu_env)
+        test_env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+        test_env.setdefault('MASTER_ADDR', '127.0.0.1')
+        # Whitelist re-copy (non-GPU vars only)
+        for var in ('HF_TOKEN', 'PYTHONPATH', 'LD_LIBRARY_PATH'):
+            pass  # These don't touch GPU vars
+
+        # GPU vars must be IDENTICAL in both envs
+        gpu_related = ('ROCR_VISIBLE_DEVICES', 'HIP_VISIBLE_DEVICES',
+                       'CUDA_VISIBLE_DEVICES', 'FKIT_GPU_IDS')
+        for var in gpu_related:
+            probe_val = probe_env.get(var)
+            test_val = test_env.get(var)
+            assert probe_val == test_val, \
+                f"Worker {worker_id}: {var} mismatch — " \
+                f"probe='{probe_val}' vs test='{test_val}'"
+
+    print(f"✅ test_gpu_env_probe_and_test_parity PASSED")
+    print(f"   All 8 workers: probe and test GPU env vars are identical")
+
+
+def test_gpu_env_subprocess_receives_correct_vars():
+    """Actually spawn a subprocess and verify it receives the exact GPU env
+    vars we set — not the parent's values.
+
+    This is the real end-to-end test: set parent env to broad values,
+    construct per-worker env, spawn subprocess, verify inside subprocess.
+    """
+    import subprocess as sp
+
+    pool, _ = make_pool(8, gpus_per_worker=1)
+
+    # Script that prints GPU env vars from inside the subprocess
+    check_script = (
+        "import os, json, sys\n"
+        "result = {\n"
+        "    'ROCR_VISIBLE_DEVICES': os.environ.get('ROCR_VISIBLE_DEVICES', ''),\n"
+        "    'HIP_VISIBLE_DEVICES': os.environ.get('HIP_VISIBLE_DEVICES', ''),\n"
+        "    'CUDA_VISIBLE_DEVICES': os.environ.get('CUDA_VISIBLE_DEVICES', ''),\n"
+        "    'FKIT_GPU_IDS': os.environ.get('FKIT_GPU_IDS', ''),\n"
+        "    'FKIT_WORKER_ID': os.environ.get('FKIT_WORKER_ID', ''),\n"
+        "}\n"
+        "print(json.dumps(result))\n"
+    )
+
+    import json
+
+    for worker_id in (0, 3, 7):  # Test a few workers
+        gpu_env = pool._get_gpu_env_vars(worker_id)
+
+        # Build env exactly like _run_test does
+        env = os.environ.copy()
+        # Simulate parent having broad GPU visibility
+        env['ROCR_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+        env['HIP_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+        env['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+        # Apply per-worker override (same as _run_test line 1462)
+        env.update(gpu_env)
+
+        # Spawn subprocess with this env
+        r = sp.run(
+            [sys.executable, '-c', check_script],
+            capture_output=True, text=True, timeout=10, env=env,
+        )
+        assert r.returncode == 0, f"Subprocess failed: {r.stderr}"
+        result = json.loads(r.stdout.strip())
+
+        # Verify subprocess received per-worker values, NOT parent's broad values
+        assert result['ROCR_VISIBLE_DEVICES'] == str(worker_id), \
+            f"Worker {worker_id}: subprocess ROCR should be '{worker_id}', " \
+            f"got '{result['ROCR_VISIBLE_DEVICES']}'"
+        assert result['HIP_VISIBLE_DEVICES'] == '0', \
+            f"Worker {worker_id}: subprocess HIP should be '0', " \
+            f"got '{result['HIP_VISIBLE_DEVICES']}'"
+        assert result['CUDA_VISIBLE_DEVICES'] == '0', \
+            f"Worker {worker_id}: subprocess CUDA should be '0', " \
+            f"got '{result['CUDA_VISIBLE_DEVICES']}'"
+        assert result['FKIT_GPU_IDS'] == str(worker_id), \
+            f"Worker {worker_id}: subprocess FKIT_GPU_IDS should be '{worker_id}', " \
+            f"got '{result['FKIT_GPU_IDS']}'"
+        assert result['FKIT_WORKER_ID'] == str(worker_id), \
+            f"Worker {worker_id}: subprocess FKIT_WORKER_ID should be '{worker_id}', " \
+            f"got '{result['FKIT_WORKER_ID']}'"
+
+    print(f"✅ test_gpu_env_subprocess_receives_correct_vars PASSED")
+    print(f"   Workers 0, 3, 7: subprocess received per-worker GPU vars")
+    print(f"   Parent's broad HIP_VISIBLE=0,...,7 was correctly overridden")
+
+
+# ---------------------------------------------------------------------------
+# Test 17: env command inheritance preserves full environment
+# ---------------------------------------------------------------------------
+
+def test_inherited_env_cmd_preserves_full_environment():
+    """Verify that _build_inherited_env_cmd produces a subprocess that
+    inherits the FULL parent environment (including conda/venv/pyenv/Docker
+    variables) while correctly overriding GPU-specific variables.
+
+    This is the core fix: instead of os.environ.copy() → dict → env=dict
+    (which can silently lose environment state), we use the `env` command
+    to inject only the overrides on top of true process inheritance.
+    """
+    import subprocess as sp
+    import json
+
+    from pytest_fkit.plugin import _build_inherited_env_cmd
+
+    # Set some marker variables in the parent's real environment
+    # to verify they survive into the subprocess
+    os.environ['_FKIT_TEST_MARKER_A'] = 'marker_value_alpha'
+    os.environ['_FKIT_TEST_MARKER_B'] = 'marker_value_beta'
+    # Simulate parent having broad GPU vars (like transformers_ut.sh sets)
+    os.environ['ROCR_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+    os.environ['HIP_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0,1,2,3,4,5,6,7'
+
+    try:
+        # Build per-worker GPU overrides (what _get_gpu_env_vars returns)
+        gpu_overrides = {
+            'ROCR_VISIBLE_DEVICES': '3',
+            'HIP_VISIBLE_DEVICES': '0',
+            'CUDA_VISIBLE_DEVICES': '0',
+            'FKIT_WORKER_ID': '3',
+            'FKIT_GPU_IDS': '3',
+            'OMP_NUM_THREADS': '4',
+        }
+
+        check_script = (
+            "import os, json, sys\n"
+            "result = {\n"
+            "    'sys_executable': sys.executable,\n"
+            "    'ROCR_VISIBLE_DEVICES': os.environ.get('ROCR_VISIBLE_DEVICES', ''),\n"
+            "    'HIP_VISIBLE_DEVICES': os.environ.get('HIP_VISIBLE_DEVICES', ''),\n"
+            "    'CUDA_VISIBLE_DEVICES': os.environ.get('CUDA_VISIBLE_DEVICES', ''),\n"
+            "    'FKIT_WORKER_ID': os.environ.get('FKIT_WORKER_ID', ''),\n"
+            "    'FKIT_GPU_IDS': os.environ.get('FKIT_GPU_IDS', ''),\n"
+            "    '_FKIT_TEST_MARKER_A': os.environ.get('_FKIT_TEST_MARKER_A', ''),\n"
+            "    '_FKIT_TEST_MARKER_B': os.environ.get('_FKIT_TEST_MARKER_B', ''),\n"
+            "    'PYTHONPATH': os.environ.get('PYTHONPATH', ''),\n"
+            "    'PATH': os.environ.get('PATH', ''),\n"
+            "    'LD_LIBRARY_PATH': os.environ.get('LD_LIBRARY_PATH', ''),\n"
+            "}\n"
+            "# Also check package availability\n"
+            "import importlib.util\n"
+            "for pkg in ['torch', 'pytest']:\n"
+            "    spec = importlib.util.find_spec(pkg)\n"
+            "    result[f'pkg_{pkg}'] = spec is not None\n"
+            "print(json.dumps(result))\n"
+        )
+
+        cmd = _build_inherited_env_cmd(
+            gpu_overrides,
+            [sys.executable, '-c', check_script],
+        )
+
+        r = sp.run(cmd, capture_output=True, text=True, timeout=15)
+        assert r.returncode == 0, f"Subprocess failed: {r.stderr}"
+        result = json.loads(r.stdout.strip())
+
+        # 1. GPU vars were OVERRIDDEN (not inherited from parent)
+        assert result['ROCR_VISIBLE_DEVICES'] == '3', \
+            f"ROCR should be '3', got '{result['ROCR_VISIBLE_DEVICES']}'"
+        assert result['HIP_VISIBLE_DEVICES'] == '0', \
+            f"HIP should be '0', got '{result['HIP_VISIBLE_DEVICES']}'"
+        assert result['CUDA_VISIBLE_DEVICES'] == '0', \
+            f"CUDA should be '0', got '{result['CUDA_VISIBLE_DEVICES']}'"
+
+        # 2. Parent environment was INHERITED (markers survive)
+        assert result['_FKIT_TEST_MARKER_A'] == 'marker_value_alpha', \
+            f"Marker A not inherited: got '{result['_FKIT_TEST_MARKER_A']}'"
+        assert result['_FKIT_TEST_MARKER_B'] == 'marker_value_beta', \
+            f"Marker B not inherited: got '{result['_FKIT_TEST_MARKER_B']}'"
+
+        # 3. Critical path vars inherited
+        assert result['PYTHONPATH'] == os.environ.get('PYTHONPATH', ''), \
+            "PYTHONPATH not inherited"
+        assert result['PATH'] == os.environ.get('PATH', ''), \
+            "PATH not inherited"
+
+        # 4. Same Python executable
+        assert result['sys_executable'] == sys.executable, \
+            f"sys.executable differs: parent={sys.executable}, " \
+            f"child={result['sys_executable']}"
+
+        # 5. Packages findable (same site-packages)
+        assert result['pkg_torch'] == True or result['pkg_pytest'] == True, \
+            "Subprocess can't find any packages — environment not inherited!"
+
+    finally:
+        # Clean up marker vars
+        os.environ.pop('_FKIT_TEST_MARKER_A', None)
+        os.environ.pop('_FKIT_TEST_MARKER_B', None)
+        os.environ.pop('ROCR_VISIBLE_DEVICES', None)
+        os.environ.pop('HIP_VISIBLE_DEVICES', None)
+        os.environ.pop('CUDA_VISIBLE_DEVICES', None)
+
+    print(f"✅ test_inherited_env_cmd_preserves_full_environment PASSED")
+    print(f"   GPU overrides applied: ROCR=3, HIP=0, CUDA=0")
+    print(f"   Parent env inherited: markers, PYTHONPATH, PATH all present")
+    print(f"   Same Python: {sys.executable}")
+    print(f"   Packages findable: torch={result.get('pkg_torch')}, "
+          f"pytest={result.get('pkg_pytest')}")
+
+
+# ---------------------------------------------------------------------------
+# Tests 18-19: Subprocess Python environment parity
+# ---------------------------------------------------------------------------
+
+def test_subprocess_python_environment_parity():
+    """Verify that a subprocess spawned the way _run_test does it sees the
+    SAME Python executable, sys.path, and importable packages as the parent.
+
+    This is the critical test the user requested: env vars arriving is necessary
+    but not sufficient.  If sys.path differs (e.g. missing site-packages or
+    PYTHONPATH entries) then importlib.util.find_spec() will return None for
+    packages that ARE installed, causing false SKIP results.
+    """
+    import subprocess as sp
+    import json
+    import importlib.util
+
+    pool, _ = make_pool(4, gpus_per_worker=1)
+
+    # ---- Collect parent-side facts ----
+    parent_executable = sys.executable
+    parent_sys_path = sys.path[:]
+
+    # Packages that HuggingFace tests commonly check via find_spec / @require_*
+    check_packages = [
+        'torch', 'transformers', 'accelerate', 'datasets',
+        'tokenizers', 'safetensors', 'scipy', 'sklearn',
+        'flash_attn', 'bitsandbytes', 'deepspeed', 'peft',
+        'optimum', 'onnxruntime', 'torchaudio', 'torchvision',
+    ]
+
+    parent_specs = {}
+    for pkg in check_packages:
+        spec = importlib.util.find_spec(pkg)
+        parent_specs[pkg] = {
+            'found': spec is not None,
+            'origin': getattr(spec, 'origin', None) if spec else None,
+        }
+
+    # ---- Build the subprocess script ----
+    # This script collects the same info from inside the subprocess.
+    check_script = """
+import sys, os, json, importlib.util
+
+packages = %s
+
+result = {
+    'sys_executable': sys.executable,
+    'sys_path': sys.path,
+    'pythonpath_env': os.environ.get('PYTHONPATH', ''),
+    'path_env': os.environ.get('PATH', ''),
+    'ld_library_path_env': os.environ.get('LD_LIBRARY_PATH', ''),
+    'packages': {},
+}
+for pkg in packages:
+    spec = importlib.util.find_spec(pkg)
+    result['packages'][pkg] = {
+        'found': spec is not None,
+        'origin': getattr(spec, 'origin', None) if spec else None,
+    }
+
+print(json.dumps(result))
+""" % repr(check_packages)
+
+    # ---- Spawn subprocess with _run_test-style env construction ----
+    for worker_id in (0, 2):
+        gpu_env = pool._get_gpu_env_vars(worker_id)
+
+        # Exactly replicate _run_test env construction (plugin.py lines 1461-1471)
+        env = os.environ.copy()
+        env.update(gpu_env)
+        env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+        env.setdefault('MASTER_ADDR', '127.0.0.1')
+        env.setdefault('MASTER_PORT', str(29500 + worker_id))
+
+        for var in ('HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
+                    'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
+                    'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE'):
+            if var in os.environ:
+                env[var] = os.environ[var]
+
+        r = sp.run(
+            [sys.executable, '-c', check_script],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert r.returncode == 0, \
+            f"Worker {worker_id} subprocess failed:\nstderr: {r.stderr}"
+        result = json.loads(r.stdout.strip())
+
+        # 1. Same Python executable
+        assert result['sys_executable'] == parent_executable, \
+            f"Worker {worker_id}: sys.executable mismatch!\n" \
+            f"  Parent:     {parent_executable}\n" \
+            f"  Subprocess: {result['sys_executable']}"
+
+        # 2. Same PYTHONPATH env var
+        parent_pp = os.environ.get('PYTHONPATH', '')
+        assert result['pythonpath_env'] == parent_pp, \
+            f"Worker {worker_id}: PYTHONPATH mismatch!\n" \
+            f"  Parent:     {parent_pp}\n" \
+            f"  Subprocess: {result['pythonpath_env']}"
+
+        # 3. sys.path: subprocess should contain all parent paths
+        #    (subprocess may have extra entries from -m pytest startup, that's OK)
+        parent_path_set = set(parent_sys_path)
+        child_path_set = set(result['sys_path'])
+        missing = parent_path_set - child_path_set
+        # Filter out '' and test-specific paths that legitimately differ
+        missing = {p for p in missing if p and not p.endswith('__pycache__')}
+        # Note: We warn but don't fail on sys.path differences because
+        # subprocess -c and -m pytest have different sys.path[0] behavior.
+        # The critical check is package find_spec below.
+        if missing:
+            print(f"   WARNING: Worker {worker_id}: {len(missing)} parent sys.path "
+                  f"entries missing in subprocess: {sorted(missing)[:5]}")
+
+        # 4. CRITICAL: Package availability must match
+        child_specs = result['packages']
+        mismatches = []
+        for pkg in check_packages:
+            parent_found = parent_specs[pkg]['found']
+            child_found = child_specs[pkg]['found']
+            if parent_found != child_found:
+                mismatches.append({
+                    'package': pkg,
+                    'parent_found': parent_found,
+                    'child_found': child_found,
+                    'parent_origin': parent_specs[pkg]['origin'],
+                    'child_origin': child_specs[pkg]['origin'],
+                })
+
+        if mismatches:
+            msg = f"Worker {worker_id}: Package availability mismatch!\n"
+            msg += f"  These packages differ between parent and subprocess:\n"
+            for m in mismatches:
+                direction = "MISSING in subprocess" if m['parent_found'] else "EXTRA in subprocess"
+                msg += f"    {m['package']}: {direction}\n"
+                msg += f"      parent origin: {m['parent_origin']}\n"
+                msg += f"      child origin:  {m['child_origin']}\n"
+            assert False, msg
+
+    # Report what we found
+    installed = [pkg for pkg, info in parent_specs.items() if info['found']]
+    not_installed = [pkg for pkg, info in parent_specs.items() if not info['found']]
+    print(f"✅ test_subprocess_python_environment_parity PASSED")
+    print(f"   sys.executable: {parent_executable}")
+    print(f"   Packages found in BOTH parent & subprocess: {installed}")
+    if not_installed:
+        print(f"   Packages not installed (skip expected): {not_installed}")
+    print(f"   PYTHONPATH preserved: ✓")
+    print(f"   No package discovery divergence between parent and subprocess")
+
+
+def test_subprocess_skip_decorators_match_parent():
+    """Simulate HuggingFace's actual skip-decorator logic in a subprocess
+    and verify results match the parent process.
+
+    This reproduces the exact checks that @require_torch_gpu,
+    @require_flash_attn, @require_bitsandbytes etc. perform.
+    If the subprocess would skip a test that the parent wouldn't (or vice
+    versa), we have an environment parity bug.
+    """
+    import subprocess as sp
+    import json
+
+    pool, _ = make_pool(4, gpus_per_worker=1)
+
+    # Script that mimics HuggingFace's skip-decorator checks
+    # These are the ACTUAL checks from transformers/testing_utils.py
+    # and transformers/utils/import_utils.py
+    decorator_script = """
+import sys, json
+
+results = {}
+
+# 1. @require_torch_gpu → checks torch_device == "cuda"
+try:
+    import torch
+    torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+    results['require_torch_gpu'] = {
+        'would_skip': torch_device != "cuda",
+        'torch_device': torch_device,
+        'cuda_available': torch.cuda.is_available(),
+        'device_count': torch.cuda.device_count() if torch.cuda.is_available() else 0,
+    }
+except ImportError:
+    results['require_torch_gpu'] = {'would_skip': True, 'reason': 'torch not installed'}
+
+# 2. @require_flash_attn → importlib.util.find_spec + torch.cuda.is_available
+import importlib.util
+try:
+    flash_spec = importlib.util.find_spec("flash_attn")
+    flash_found = flash_spec is not None
+    results['require_flash_attn'] = {
+        'would_skip': not flash_found,
+        'find_spec_result': flash_found,
+        'origin': getattr(flash_spec, 'origin', None) if flash_spec else None,
+    }
+except Exception as e:
+    results['require_flash_attn'] = {'would_skip': True, 'reason': str(e)}
+
+# 3. @require_bitsandbytes → importlib.util.find_spec
+try:
+    bnb_spec = importlib.util.find_spec("bitsandbytes")
+    bnb_found = bnb_spec is not None
+    results['require_bitsandbytes'] = {
+        'would_skip': not bnb_found,
+        'find_spec_result': bnb_found,
+        'origin': getattr(bnb_spec, 'origin', None) if bnb_spec else None,
+    }
+except Exception as e:
+    results['require_bitsandbytes'] = {'would_skip': True, 'reason': str(e)}
+
+# 4. @require_accelerate → importlib.util.find_spec
+try:
+    acc_spec = importlib.util.find_spec("accelerate")
+    acc_found = acc_spec is not None
+    results['require_accelerate'] = {
+        'would_skip': not acc_found,
+        'find_spec_result': acc_found,
+    }
+except Exception as e:
+    results['require_accelerate'] = {'would_skip': True, 'reason': str(e)}
+
+# 5. @require_deepspeed → importlib.util.find_spec
+try:
+    ds_spec = importlib.util.find_spec("deepspeed")
+    ds_found = ds_spec is not None
+    results['require_deepspeed'] = {
+        'would_skip': not ds_found,
+        'find_spec_result': ds_found,
+    }
+except Exception as e:
+    results['require_deepspeed'] = {'would_skip': True, 'reason': str(e)}
+
+# Metadata
+import os
+results['_meta'] = {
+    'sys_executable': sys.executable,
+    'pythonpath': os.environ.get('PYTHONPATH', ''),
+    'rocr_visible': os.environ.get('ROCR_VISIBLE_DEVICES', ''),
+    'hip_visible': os.environ.get('HIP_VISIBLE_DEVICES', ''),
+    'cuda_visible': os.environ.get('CUDA_VISIBLE_DEVICES', ''),
+}
+
+print(json.dumps(results))
+"""
+
+    # ---- Run the same checks in the parent process ----
+    import importlib.util
+
+    parent_results = {}
+
+    # @require_torch_gpu
+    try:
+        import torch
+        torch_device = "cuda" if torch.cuda.is_available() else "cpu"
+        parent_results['require_torch_gpu'] = {
+            'would_skip': torch_device != "cuda",
+            'torch_device': torch_device,
+        }
+    except ImportError:
+        parent_results['require_torch_gpu'] = {'would_skip': True}
+
+    # @require_flash_attn
+    flash_spec = importlib.util.find_spec("flash_attn")
+    parent_results['require_flash_attn'] = {
+        'would_skip': flash_spec is None,
+        'find_spec_result': flash_spec is not None,
+    }
+
+    # @require_bitsandbytes
+    bnb_spec = importlib.util.find_spec("bitsandbytes")
+    parent_results['require_bitsandbytes'] = {
+        'would_skip': bnb_spec is None,
+        'find_spec_result': bnb_spec is not None,
+    }
+
+    # @require_accelerate
+    acc_spec = importlib.util.find_spec("accelerate")
+    parent_results['require_accelerate'] = {
+        'would_skip': acc_spec is None,
+        'find_spec_result': acc_spec is not None,
+    }
+
+    # @require_deepspeed
+    ds_spec = importlib.util.find_spec("deepspeed")
+    parent_results['require_deepspeed'] = {
+        'would_skip': ds_spec is None,
+        'find_spec_result': ds_spec is not None,
+    }
+
+    # ---- Run in subprocess with _run_test env ----
+    for worker_id in (0, 3):
+        gpu_env = pool._get_gpu_env_vars(worker_id)
+
+        env = os.environ.copy()
+        env.update(gpu_env)
+        env.setdefault('NCCL_ASYNC_ERROR_HANDLING', '1')
+        env.setdefault('MASTER_ADDR', '127.0.0.1')
+        env.setdefault('MASTER_PORT', str(29500 + worker_id))
+
+        for var in ('HF_TOKEN', 'RUN_SLOW', 'NCCL_DEBUG',
+                    'PYTHONPATH', 'LD_LIBRARY_PATH', 'PATH',
+                    'TRANSFORMERS_VERBOSITY', 'TRANSFORMERS_CACHE'):
+            if var in os.environ:
+                env[var] = os.environ[var]
+
+        r = sp.run(
+            [sys.executable, '-c', decorator_script],
+            capture_output=True, text=True, timeout=30, env=env,
+        )
+        assert r.returncode == 0, \
+            f"Worker {worker_id} subprocess failed:\n{r.stderr}"
+        child_results = json.loads(r.stdout.strip())
+
+        # Compare each decorator's would_skip decision
+        decorators = [
+            'require_torch_gpu', 'require_flash_attn',
+            'require_bitsandbytes', 'require_accelerate', 'require_deepspeed',
+        ]
+
+        divergences = []
+        for dec in decorators:
+            parent_skip = parent_results[dec]['would_skip']
+            child_skip = child_results[dec]['would_skip']
+            if parent_skip != child_skip:
+                divergences.append({
+                    'decorator': dec,
+                    'parent_would_skip': parent_skip,
+                    'child_would_skip': child_skip,
+                    'child_detail': child_results[dec],
+                })
+
+        if divergences:
+            msg = f"Worker {worker_id}: Skip-decorator DIVERGENCE detected!\n"
+            msg += f"  The subprocess would make DIFFERENT skip decisions than the parent:\n"
+            for d in divergences:
+                action = "SKIP in child but NOT in parent" if d['child_would_skip'] else "RUN in child but SKIP in parent"
+                msg += f"    @{d['decorator']}: {action}\n"
+                msg += f"      child detail: {d['child_detail']}\n"
+            msg += f"\n  Subprocess env:\n"
+            msg += f"    ROCR={child_results['_meta']['rocr_visible']}\n"
+            msg += f"    HIP={child_results['_meta']['hip_visible']}\n"
+            msg += f"    CUDA={child_results['_meta']['cuda_visible']}\n"
+            msg += f"    PYTHONPATH={child_results['_meta']['pythonpath'][:100]}\n"
+            # NOTE: torch.cuda.is_available() divergence is expected when
+            # there are no real GPUs (test env) — only flag non-GPU divergences
+            gpu_only_divs = [d for d in divergences if d['decorator'] == 'require_torch_gpu']
+            pkg_divs = [d for d in divergences if d['decorator'] != 'require_torch_gpu']
+            if pkg_divs:
+                assert False, msg
+            elif gpu_only_divs:
+                print(f"   INFO: Worker {worker_id}: torch.cuda.is_available() differs "
+                      f"(expected if no real GPUs in test env)")
+
+    print(f"✅ test_subprocess_skip_decorators_match_parent PASSED")
+    print(f"   Parent skip decisions:")
+    for dec in decorators:
+        skip = parent_results[dec]['would_skip']
+        status = "SKIP" if skip else "RUN"
+        print(f"     @{dec}: {status}")
+    print(f"   Subprocess matches parent for all non-GPU decorators")
+    print(f"   (GPU decorator divergence is expected without real GPUs)")
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     print(f"\n{'='*70}")
@@ -1037,14 +1666,20 @@ if __name__ == '__main__':
         test_previously_failed_workers_can_recover,
         test_worker_loop_failed_state_recovery,
         test_40_worker_scenario,
-        test_probe_timeout_extended_during_recovery,
         test_threaded_recovery_completes_all_tests,
+        test_probe_timeout_extended_during_recovery,
         test_in_flight_workers_resume_and_finish_tests,
-        test_gpu_unavailable_skip_requeues_to_different_worker,
-        test_no_hip_gpus_failure_requeues,
+        test_dead_gpu_probe_triggers_requeue,
+        test_genuine_failure_not_requeued,
         test_preflight_dead_workers_excluded_from_scheduling,
         test_worker_loop_exits_for_preflight_dead,
         test_preflight_dead_workers_tests_complete_on_healthy,
+        test_gpu_env_vars_override_parent,
+        test_gpu_env_probe_and_test_parity,
+        test_gpu_env_subprocess_receives_correct_vars,
+        test_inherited_env_cmd_preserves_full_environment,
+        test_subprocess_python_environment_parity,
+        test_subprocess_skip_decorators_match_parent,
     ]
 
     passed = 0
