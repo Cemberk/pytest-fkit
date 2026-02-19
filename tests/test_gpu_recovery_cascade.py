@@ -1654,6 +1654,211 @@ print(json.dumps(results))
 
 
 # ---------------------------------------------------------------------------
+# Test 20: GPU transient error (NCCL) re-queued to different worker
+# ---------------------------------------------------------------------------
+
+def test_nccl_transient_requeued_to_different_worker():
+    """
+    When a test fails with NCCL Error 2 (GPU transient) and all 3 local
+    retries are exhausted, the test should be re-queued to a different
+    worker instead of being marked as permanently failed.
+
+    Setup:
+      - 4 workers, 5 tests
+      - Worker 0's GPU pair has NCCL issues: _run_test returns 'failed'
+        with 'NCCL Error 2: unhandled system error' in longrepr
+      - Other workers' tests pass normally
+      - Health probe returns True for ALL workers (GPUs are "healthy"
+        individually — the NCCL issue is between the pair)
+
+    Verify:
+      a. Test is retried 3 times on worker 0 (in-place retries)
+      b. After retries exhaust, test is re-queued to a different worker
+      c. Test passes on the different worker
+      d. ALL 5 tests resolve
+      e. gpu_requeues stat is incremented
+    """
+    NUM_WORKERS = 4
+    pool, results = make_pool(NUM_WORKERS)
+
+    tests_lock = threading.Lock()
+    execution_log = []
+    nccl_worker = 0  # This worker has NCCL issues between its GPU pair
+    nccl_attempts = {'count': 0}
+
+    test_items = [FakeItem(f"tests/test_{i:03d}.py::test_run") for i in range(5)]
+
+    def mock_run_test(nodeid, worker_id, gpu_env):
+        if worker_id == nccl_worker and nodeid == test_items[0].nodeid:
+            # NCCL error on this worker's GPU pair
+            with tests_lock:
+                nccl_attempts['count'] += 1
+            return TestResult(
+                nodeid=nodeid, outcome='failed', duration=0.5,
+                longrepr='RuntimeError: NCCL Error 2: unhandled system error',
+                worker_id=worker_id,
+            )
+
+        # All other workers/tests pass
+        threading.Event().wait(timeout=0.02)
+        with tests_lock:
+            execution_log.append((nodeid, worker_id, 'passed'))
+        return TestResult(
+            nodeid=nodeid, outcome='passed', duration=0.02,
+            worker_id=worker_id,
+        )
+
+    def mock_reset(gpu_env, gpu_vendor):
+        return True
+
+    def mock_probe(gpu_env, timeout=15):
+        # All GPUs probe healthy — the NCCL issue is between pairs,
+        # not visible in single-GPU health probes
+        return True
+
+    _noop = threading.Event()
+
+    with mock.patch.object(pool, '_run_test', side_effect=mock_run_test):
+        with mock.patch('pytest_fkit.plugin._reset_gpu', side_effect=mock_reset):
+            with mock.patch('pytest_fkit.plugin._gpu_health_probe', side_effect=mock_probe):
+                with mock.patch('pytest_fkit.plugin.time.sleep'):
+                    pool.submit_tests(test_items)
+                    pool.start()
+
+                    deadline = time.time() + 30
+                    while not pool.scheduler.is_done() and time.time() < deadline:
+                        _noop.wait(timeout=0.1)
+
+                    if not pool.scheduler.is_done():
+                        pool.shutdown()
+                        resolved = pool.scheduler._total_resolved
+                        total = pool.scheduler._total_submitted
+                        assert False, (
+                            f"HANG DETECTED! {resolved}/{total} tests resolved "
+                            f"after 30s"
+                        )
+
+                    pool.wait_for_completion()
+
+    total = pool.scheduler._total_submitted
+    resolved = pool.scheduler._total_resolved
+    stats = pool.stats
+
+    # 1. ALL tests resolved
+    assert resolved == total, \
+        f"Only {resolved}/{total} tests resolved!"
+
+    # 2. NCCL test was retried locally (3 retries + 1 original = 4 attempts)
+    assert nccl_attempts['count'] >= 4, \
+        f"Expected >= 4 NCCL attempts on worker {nccl_worker}, " \
+        f"got {nccl_attempts['count']}"
+
+    # 3. Test was re-queued and passed on a different worker
+    with tests_lock:
+        nccl_test_passed = any(
+            nid == test_items[0].nodeid for nid, wid, _ in execution_log
+        )
+    assert nccl_test_passed, \
+        "NCCL-failed test was NOT re-queued to a different worker!"
+
+    # 4. gpu_requeues stat was incremented
+    assert stats.get('gpu_requeues', 0) >= 1, \
+        f"Expected gpu_requeues >= 1, got {stats.get('gpu_requeues', 0)}"
+
+    passed = sum(1 for _, r in results if r.outcome == 'passed')
+    print(f"✅ test_nccl_transient_requeued_to_different_worker PASSED")
+    print(f"   Tests: {resolved}/{total} resolved ({passed} passed)")
+    print(f"   NCCL attempts on worker {nccl_worker}: {nccl_attempts['count']}")
+    print(f"   gpu_requeues: {stats.get('gpu_requeues', 0)}")
+    print(f"   gpu_errors: {stats.get('gpu_errors', 0)}")
+
+
+# ---------------------------------------------------------------------------
+# Test 21: GPU transient re-queue limited to 1 (no infinite loop)
+# ---------------------------------------------------------------------------
+
+def test_nccl_requeue_limited_no_infinite_loop():
+    """
+    If a test fails with NCCL Error 2 on EVERY worker, it should NOT
+    loop infinitely.  After 1 re-queue, it becomes terminal.
+
+    Setup:
+      - 2 workers, 2 tests
+      - BOTH workers fail with NCCL Error 2 for test_000
+
+    Verify:
+      a. Test is re-queued exactly once
+      b. After second worker also fails, test is marked as terminal failure
+      c. No hang or infinite loop
+    """
+    NUM_WORKERS = 2
+    pool, results = make_pool(NUM_WORKERS)
+
+    tests_lock = threading.Lock()
+    nccl_attempts = {'count': 0}
+    test_items = [FakeItem(f"tests/test_{i:03d}.py::test_run") for i in range(2)]
+
+    def mock_run_test(nodeid, worker_id, gpu_env):
+        if nodeid == test_items[0].nodeid:
+            # NCCL error on ALL workers for this test
+            with tests_lock:
+                nccl_attempts['count'] += 1
+            return TestResult(
+                nodeid=nodeid, outcome='failed', duration=0.1,
+                longrepr='RuntimeError: NCCL Error 2: unhandled system error',
+                worker_id=worker_id,
+            )
+
+        # Other tests pass
+        threading.Event().wait(timeout=0.02)
+        return TestResult(
+            nodeid=nodeid, outcome='passed', duration=0.02,
+            worker_id=worker_id,
+        )
+
+    _noop = threading.Event()
+
+    with mock.patch.object(pool, '_run_test', side_effect=mock_run_test):
+        with recovery_patches():
+            pool.submit_tests(test_items)
+            pool.start()
+
+            deadline = time.time() + 30
+            while not pool.scheduler.is_done() and time.time() < deadline:
+                _noop.wait(timeout=0.1)
+
+            if not pool.scheduler.is_done():
+                pool.shutdown()
+                resolved = pool.scheduler._total_resolved
+                total = pool.scheduler._total_submitted
+                assert False, (
+                    f"INFINITE LOOP! {resolved}/{total} tests resolved "
+                    f"after 30s"
+                )
+
+            pool.wait_for_completion()
+
+    total = pool.scheduler._total_submitted
+    resolved = pool.scheduler._total_resolved
+
+    # 1. ALL tests resolved (no hang)
+    assert resolved == total, \
+        f"Only {resolved}/{total} tests resolved!"
+
+    # 2. NCCL test was eventually marked as failed (terminal)
+    nccl_results = [r for _, r in results if r.nodeid == test_items[0].nodeid]
+    assert len(nccl_results) == 1, \
+        f"Expected exactly 1 result for NCCL test, got {len(nccl_results)}"
+    assert nccl_results[0].outcome == 'failed', \
+        f"NCCL test should be terminal 'failed', got '{nccl_results[0].outcome}'"
+
+    print(f"✅ test_nccl_requeue_limited_no_infinite_loop PASSED")
+    print(f"   Tests: {resolved}/{total} resolved")
+    print(f"   Total NCCL attempts across workers: {nccl_attempts['count']}")
+    print(f"   (bounded, no infinite loop)")
+
+
+# ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
     print(f"\n{'='*70}")
@@ -1680,6 +1885,8 @@ if __name__ == '__main__':
         test_inherited_env_cmd_preserves_full_environment,
         test_subprocess_python_environment_parity,
         test_subprocess_skip_decorators_match_parent,
+        test_nccl_transient_requeued_to_different_worker,
+        test_nccl_requeue_limited_no_infinite_loop,
     ]
 
     passed = 0

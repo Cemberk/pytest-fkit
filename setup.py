@@ -6,7 +6,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="pytest-fkit",
-    version="0.9.4",
+    version="0.9.5",
     author="Cemberk",
     description="A pytest plugin that prevents crashes from killing your test suite",
     long_description=long_description,

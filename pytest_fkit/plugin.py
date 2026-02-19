@@ -761,6 +761,8 @@ class WorkScheduler:
         self._max_crashes = max_crashes_per_test
         self._crash_counts: Dict[str, int] = {}
         self._crash_workers: Dict[str, set] = {}
+        self._gpu_requeue_counts: Dict[str, int] = {}
+        self._gpu_requeue_workers: Dict[str, set] = {}
 
         # --- State tracking (the invariant) ---
         self._in_flight: Dict[int, object] = {}   # worker_id → item
@@ -775,6 +777,7 @@ class WorkScheduler:
         self._stats = {
             'restarts': 0,
             'permanent_crashes': 0,
+            'gpu_requeues': 0,
         }
 
     # ----- submit -----
@@ -790,7 +793,13 @@ class WorkScheduler:
     # ----- get / return work -----
 
     def get_work(self, worker_id: int, timeout: float = 0.5):
-        """QUEUED → IN_FLIGHT.  Returns item or None."""
+        """QUEUED → IN_FLIGHT.  Returns item or None.
+
+        When a test was re-queued due to GPU transient errors, avoid
+        assigning it back to the same worker that failed it (different
+        GPU pair should be tried).  If no other healthy workers exist,
+        fall back to running it anyway.
+        """
         with self._lock:
             if self._worker_health.get(worker_id) != 'healthy':
                 return None
@@ -801,6 +810,24 @@ class WorkScheduler:
             item = self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
+
+        # Check if this worker already failed this test with a GPU
+        # transient error.  If so, put it back for a different worker.
+        nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+        with self._lock:
+            failed_workers = self._gpu_requeue_workers.get(nodeid, set())
+            if worker_id in failed_workers:
+                # Check if any OTHER healthy worker exists
+                other_healthy = any(
+                    h == 'healthy' and wid != worker_id
+                    for wid, h in self._worker_health.items()
+                )
+                if other_healthy:
+                    # Put it back and return None — another worker will
+                    # pick it up.
+                    self._queue.put(item)
+                    return None
+                # No other healthy worker — run it anyway (last resort)
 
         with self._lock:
             self._in_flight[worker_id] = item
@@ -823,8 +850,9 @@ class WorkScheduler:
 
     # ----- report results -----
 
-    def report_result(self, item, result: 'TestResult', worker_id: int) -> bool:
-        """IN_FLIGHT → RESOLVED  or  IN_FLIGHT → QUEUED (crash restart).
+    def report_result(self, item, result: 'TestResult', worker_id: int,
+                      gpu_requeue: bool = False) -> bool:
+        """IN_FLIGHT → RESOLVED  or  IN_FLIGHT → QUEUED (crash/gpu restart).
 
         Returns True if the test was re-queued (not yet terminal).
         """
@@ -834,6 +862,9 @@ class WorkScheduler:
 
         if result.crash:
             return self._handle_crash(item, result, worker_id)
+
+        if gpu_requeue:
+            return self._handle_gpu_requeue(item, result, worker_id)
 
         # Terminal non-crash result
         self._emit(item, result)
@@ -943,6 +974,44 @@ class WorkScheduler:
         print(f"   🔁 Scheduler: re-queuing {nodeid} after crash "
               f"(attempt {count}/{self._max_crashes}, "
               f"worker {worker_id} crashed it)")
+        self._queue.put(item)
+        return True
+
+    def _handle_gpu_requeue(self, item, result: 'TestResult',
+                            worker_id: int) -> bool:
+        """Re-queue a test after GPU transient errors exhausted local retries.
+
+        When a test fails with a GPU-specific transient error (e.g. NCCL Error 2)
+        and all in-place retries on the same worker are exhausted, the test is
+        re-queued to be picked up by a different worker with different GPUs.
+
+        Limited to 1 re-queue per test to prevent infinite loops.
+        """
+        nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+
+        with self._lock:
+            self._gpu_requeue_counts[nodeid] = \
+                self._gpu_requeue_counts.get(nodeid, 0) + 1
+            self._gpu_requeue_workers.setdefault(nodeid, set()).add(worker_id)
+            count = self._gpu_requeue_counts[nodeid]
+            healthy = sum(1 for wid, h in self._worker_health.items()
+                          if h == 'healthy' and wid != worker_id)
+
+        # Give up: already re-queued once or no other healthy workers.
+        # This prevents infinite loops — each test gets at most 1 re-queue
+        # to a different worker.  If it still fails there, it's terminal.
+        if count > 1 or healthy == 0:
+            reason = ("already re-queued once" if count > 1
+                      else "no other healthy workers")
+            print(f"   ❌ Scheduler: {nodeid} GPU transient error is terminal "
+                  f"({reason})")
+            self._emit(item, result)
+            return False
+
+        with self._lock:
+            self._stats['gpu_requeues'] += 1
+        print(f"   🔁 Scheduler: re-queuing {nodeid} after GPU transient error "
+              f"(worker {worker_id} failed, {healthy} other healthy workers)")
         self._queue.put(item)
         return True
 
@@ -1417,6 +1486,29 @@ class _ScheduledWorkerPool:
                     time.sleep(min(2 ** (retry_count - 1), 4))
                     result = self._run_test(item.nodeid, worker_id, gpu_env)
 
+                # After local retries exhaust for a GPU-specific transient
+                # error, trigger system recovery and re-queue to a different
+                # worker instead of marking as permanently failed.
+                gpu_requeue = False
+                if (retry_count >= self._max_retries
+                        and result.outcome == 'failed'
+                        and not result.crash
+                        and _is_gpu_transient_error(result)):
+                    gpu_requeue = True
+                    print(f"   🔄 Worker {worker_id}: GPU transient error "
+                          f"persisted after {retry_count} retries for "
+                          f"{item.nodeid}, requesting re-queue to "
+                          f"different worker")
+                    self._system_gpu_recovery(worker_id)
+                    with self._lock:
+                        if self._worker_states[worker_id] == WorkerState.FAILED:
+                            if self.scheduler.get_worker_health(worker_id) == 'healthy':
+                                self._worker_states[worker_id] = WorkerState.RUNNING
+                            else:
+                                # Worker is dead — still report so test
+                                # can be re-queued to a surviving worker.
+                                pass
+
                 # Execution-level stats
                 with self._lock:
                     self._stats['tests_run'] += 1
@@ -1436,8 +1528,14 @@ class _ScheduledWorkerPool:
                         self._stats['gpu_errors'] += 1
 
                 # Report (IN_FLIGHT → RESOLVED or IN_FLIGHT → QUEUED)
-                self.scheduler.report_result(item, result, worker_id)
+                requeued = self.scheduler.report_result(
+                    item, result, worker_id, gpu_requeue=gpu_requeue)
                 reported = True
+
+                # --- GPU re-queue: test sent to different worker ---
+                if requeued and gpu_requeue:
+                    # Recovery already triggered above; move to next test.
+                    continue
 
                 # --- Crash recovery (system-wide) ---
                 if result.crash:
@@ -1706,6 +1804,7 @@ class _ScheduledWorkerPool:
         sched = self.scheduler.stats
         s['restarts'] = sched.get('restarts', 0)
         s['permanent_crashes'] = sched.get('permanent_crashes', 0)
+        s['gpu_requeues'] = sched.get('gpu_requeues', 0)
         return s
 
     @property
@@ -2117,7 +2216,13 @@ class CrashIsolationPlugin:
             print(f"   ⏱️  Timeouts: {stats['timeouts']}")
         if stats['gpu_errors'] > 0:
             retries = stats.get('retries', 0)
-            extra = f" (retries: {retries})" if retries else ""
+            requeues = stats.get('gpu_requeues', 0)
+            extra_parts = []
+            if retries:
+                extra_parts.append(f"retries: {retries}")
+            if requeues:
+                extra_parts.append(f"re-queued to different worker: {requeues}")
+            extra = f" ({', '.join(extra_parts)})" if extra_parts else ""
             print(f"   🎮 GPU errors: {stats['gpu_errors']}{extra}")
         if stats.get('system_resets', 0) > 0:
             print(f"   🔄 System-wide GPU resets: {stats['system_resets']}")
