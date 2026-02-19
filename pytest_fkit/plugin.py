@@ -38,10 +38,10 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Callable, Tuple
 from enum import Enum
 
-# MASTER_ADDR/MASTER_PORT are intentionally NOT set by fkit.
-# On AMD ROCm, RCCL auto-probes when these vars are present,
-# causing "NCCL Error 2" even in nn.DataParallel tests.
-# Tests that need torch.distributed set their own values.
+# Base port for per-worker NCCL MASTER_PORT allocation.
+# Each fkit worker gets NCCL_BASE_PORT + worker_id to avoid collisions
+# when multiple workers run DataParallel/DDP tests simultaneously.
+NCCL_BASE_PORT = 29500
 
 
 def pytest_addoption(parser):
@@ -598,7 +598,6 @@ def _filter_stderr(stderr: str) -> str:
 def _build_inherited_env_cmd(
         env_overrides: Dict[str, str],
         base_cmd: List[str],
-        env_unsets: List[str] | None = None,
 ) -> List[str]:
     """Build a command that inherits the parent's full environment and only
     overrides the specified variables.
@@ -609,19 +608,13 @@ def _build_inherited_env_cmd(
     ``env`` command so the child inherits the parent's real environment and
     only the listed variables are added or replaced.
 
-    ``env_unsets`` specifies variables to remove from the inherited
-    environment (``env -u VAR``).  This is used to strip MASTER_ADDR /
-    MASTER_PORT so that RCCL on AMD ROCm doesn't auto-initialize.
-
     Example::
 
         _build_inherited_env_cmd(
             {'ROCR_VISIBLE_DEVICES': '3', 'HIP_VISIBLE_DEVICES': '0'},
             ['python', '-m', 'pytest', 'test_foo.py'],
-            env_unsets=['MASTER_ADDR', 'MASTER_PORT'],
         )
-        # → ['env', '-u', 'MASTER_ADDR', '-u', 'MASTER_PORT',
-        #    'ROCR_VISIBLE_DEVICES=3', 'HIP_VISIBLE_DEVICES=0',
+        # → ['env', 'ROCR_VISIBLE_DEVICES=3', 'HIP_VISIBLE_DEVICES=0',
         #    'python', '-m', 'pytest', 'test_foo.py']
 
     The resulting command should be passed to ``subprocess.run()`` **without**
@@ -629,8 +622,6 @@ def _build_inherited_env_cmd(
     environment verbatim.
     """
     cmd = ['env']
-    for var in (env_unsets or []):
-        cmd.extend(['-u', var])
     for key, value in env_overrides.items():
         cmd.append(f'{key}={value}')
     cmd.extend(base_cmd)
@@ -674,8 +665,7 @@ def _gpu_health_probe(gpu_env: Dict[str, str], timeout: int = 15) -> bool:
     )
     try:
         cmd = _build_inherited_env_cmd(
-            gpu_env, [sys.executable, '-c', probe_script],
-            env_unsets=['MASTER_ADDR', 'MASTER_PORT'])
+            gpu_env, [sys.executable, '-c', probe_script])
         r = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
         )
@@ -1069,21 +1059,29 @@ class _ScheduledWorkerPool:
     def _get_gpu_env_vars(self, worker_id: int) -> Dict[str, str]:
         """Get GPU, CPU, and NCCL environment variables for a worker.
 
-        AMD/ROCm GPU visibility layering:
+        AMD/ROCm GPU visibility layering (per RCCL documentation):
           ROCR_VISIBLE_DEVICES  – physical GPU indices (ROCm runtime level).
+                                  Primary isolation mechanism. RCCL has no
+                                  independent GPU discovery — it inherits the
+                                  filtered view from the ROCm runtime.
           HIP_VISIBLE_DEVICES   – indices *relative to* the ROCR-visible set.
           CUDA_VISIBLE_DEVICES  – PyTorch ROCm maps this to HIP_VISIBLE_DEVICES.
 
-        If a worker owns physical GPU 3, we set:
-          ROCR_VISIBLE_DEVICES=3   (expose only that physical GPU)
-          HIP_VISIBLE_DEVICES=0    (index 0 within that single-GPU ROCR set)
-          CUDA_VISIBLE_DEVICES=0   (same, for PyTorch compat)
+        If a worker owns physical GPUs 2,3, we set:
+          ROCR_VISIBLE_DEVICES=2,3  (expose only those physical GPUs)
+          HIP_VISIBLE_DEVICES=0,1   (local indices within the ROCR set)
+          CUDA_VISIBLE_DEVICES=0,1  (same, for PyTorch compat)
 
-        NCCL/RCCL: MASTER_ADDR and MASTER_PORT are NOT set by fkit.
-          On AMD ROCm, RCCL auto-probes when these vars are present,
-          causing "NCCL Error 2" even in nn.DataParallel tests that
-          don't use torch.distributed. Tests that need distributed
-          (deepspeed, fsdp, tensor_parallel) set their own env vars.
+        NCCL/RCCL per-worker isolation (multi-GPU workers only):
+          MASTER_PORT – unique per worker to prevent PyTorch rendezvous
+                        collisions between workers running DDP tests.
+          NCCL_MIN_NCHANNELS=32 – optimizes 2-GPU communicator channel
+                        count on MI300X (RCCL auto-inflates for sub-8-GPU
+                        communicators but this ensures enough bandwidth).
+          NCCL_ASYNC_ERROR_HANDLING=1 – ensures RCCL errors surface as
+                        Python exceptions instead of silent hangs.
+          NCCL_SOCKET_IFNAME is NOT set — the Dockerfile baseline (eth0)
+                        propagates to subprocesses naturally.
         """
         gpu_ids = self.gpu_allocations[worker_id] if worker_id < len(self.gpu_allocations) else ""
 
@@ -1110,12 +1108,14 @@ class _ScheduledWorkerPool:
             env_vars['FKIT_WORKER_ID'] = str(worker_id)
             env_vars['FKIT_GPU_IDS'] = gpu_ids
 
-            # NCCL/RCCL: Do NOT set MASTER_ADDR or MASTER_PORT here.
-            # On AMD ROCm, RCCL auto-probes when these env vars are
-            # present — even for nn.DataParallel tests that don't use
-            # torch.distributed — causing "NCCL Error 2: unhandled
-            # system error". Tests that need torch.distributed (deepspeed,
-            # fsdp, tensor_parallel) set their own MASTER_ADDR/MASTER_PORT.
+            # NCCL/RCCL isolation for multi-GPU workers.
+            # Per RCCL docs: each worker needs a unique MASTER_PORT to
+            # prevent PyTorch rendezvous collisions. NCCL_MIN_NCHANNELS=32
+            # optimizes 2-GPU communicator bandwidth on MI300X.
+            if num_gpus > 1:
+                env_vars['MASTER_PORT'] = str(NCCL_BASE_PORT + worker_id)
+                env_vars['NCCL_MIN_NCHANNELS'] = '32'
+                env_vars['NCCL_ASYNC_ERROR_HANDLING'] = '1'
 
         return env_vars
 
@@ -1506,20 +1506,22 @@ class _ScheduledWorkerPool:
         try:
             start_time = time.time()
 
-            # Build per-worker env overrides (GPU vars, threads).
+            # Build per-worker env overrides (GPU vars, NCCL, threads).
             # These are injected via the `env` command so the subprocess
             # inherits the parent's FULL environment (conda, venv, pyenv,
             # Docker, etc.) instead of a reconstructed copy which can
             # silently lose variables needed for package resolution.
+            #
+            # Only set distributed env vars (MASTER_ADDR/MASTER_PORT)
+            # if the worker has multiple GPUs — needed for DataParallel
+            # and DistributedDataParallel tests.
             env_overrides = dict(gpu_env)
-
-            # Strip MASTER_ADDR/MASTER_PORT from inherited env to prevent
-            # RCCL auto-initialization on AMD ROCm. These vars cause
-            # "NCCL Error 2: unhandled system error" even in nn.DataParallel
-            # tests that never call torch.distributed.init_process_group().
-            # Tests that actually need distributed (deepspeed, fsdp,
-            # tensor_parallel) set their own MASTER_ADDR/MASTER_PORT.
-            env_unsets = ['MASTER_ADDR', 'MASTER_PORT']
+            if 'MASTER_PORT' in gpu_env:
+                # Multi-GPU worker — needs NCCL/RCCL for DataParallel/DDP
+                if 'NCCL_ASYNC_ERROR_HANDLING' not in os.environ:
+                    env_overrides['NCCL_ASYNC_ERROR_HANDLING'] = '1'
+                if 'MASTER_ADDR' not in os.environ:
+                    env_overrides['MASTER_ADDR'] = '127.0.0.1'
 
             pytest_cmd = [
                 sys.executable, '-m', 'pytest',
@@ -1530,8 +1532,7 @@ class _ScheduledWorkerPool:
                 f'--junitxml={junit_path}',
             ]
 
-            cmd = _build_inherited_env_cmd(env_overrides, pytest_cmd,
-                                          env_unsets=env_unsets)
+            cmd = _build_inherited_env_cmd(env_overrides, pytest_cmd)
 
             try:
                 proc = subprocess.run(
@@ -1824,8 +1825,14 @@ class CrashIsolationPlugin:
             print(f"   CPU cores: {self.cpu_info.total_cores} total, {self.cpu_info.physical_cores} physical")
             print(f"   Mode: {self.execution_mode} - {scheduling_desc}")
             print(f"   Transient error retries: {self.max_retries} (GPU unavailable, DNS, network, NCCL)")
-            print(f"   NCCL/RCCL: MASTER_ADDR/MASTER_PORT stripped from test subprocesses"
-                  f" (prevents RCCL auto-init on AMD ROCm)")
+            multi_gpu_workers = sum(1 for alloc in self.gpu_allocations
+                                    if len(alloc.split(',')) > 1)
+            if multi_gpu_workers > 0:
+                print(f"   NCCL ports: {NCCL_BASE_PORT}-{NCCL_BASE_PORT + self.num_workers - 1} "
+                      f"(multi-GPU workers only: {multi_gpu_workers}/{self.num_workers})")
+                print(f"   NCCL_MIN_NCHANNELS=32 (2-GPU channel optimization for MI300X)")
+            else:
+                print(f"   NCCL ports: not set (all workers are single-GPU)")
             print(f"   Crash recovery: GPU health probe + 5-15s cooldown + auto-redistribute")
             print(f"   Python: {sys.executable} (subprocess tests will use this binary)")
             # GPU preflight: verify each worker can see its GPU from a subprocess
@@ -1930,8 +1937,7 @@ class CrashIsolationPlugin:
 
         gpu_vars = self._build_gpu_env(0)
         cmd = _build_inherited_env_cmd(
-            gpu_vars, [sys.executable, '-c', script],
-            env_unsets=['MASTER_ADDR', 'MASTER_PORT'])
+            gpu_vars, [sys.executable, '-c', script])
         try:
             r = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=15,
@@ -1997,8 +2003,7 @@ class CrashIsolationPlugin:
                 continue
             try:
                 cmd = _build_inherited_env_cmd(
-                    gpu_vars, [sys.executable, '-c', probe_script],
-                    env_unsets=['MASTER_ADDR', 'MASTER_PORT'])
+                    gpu_vars, [sys.executable, '-c', probe_script])
                 r = subprocess.run(
                     cmd, capture_output=True, text=True, timeout=30,
                 )
