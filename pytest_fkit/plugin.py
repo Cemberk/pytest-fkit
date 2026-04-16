@@ -386,6 +386,7 @@ TRANSIENT_ERROR_PATTERNS = [
     '504 Gateway Timeout',
     # NCCL transient errors (often recoverable on retry with different worker)
     'NCCL Error 2: unhandled system error',
+    'NCCL Error 5: invalid usage',
     'NCCL error',
     # GPU memory (may succeed on a different worker or after GC)
     'CUDA out of memory',
@@ -404,6 +405,7 @@ GPU_TRANSIENT_PATTERNS = [
     'CUDA out of memory',
     'hipErrorOutOfMemory',
     'NCCL Error 2: unhandled system error',
+    'NCCL Error 5: invalid usage',
     'NCCL error',
 ]
 
