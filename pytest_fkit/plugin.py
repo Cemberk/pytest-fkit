@@ -102,6 +102,15 @@ def pytest_addoption(parser):
         default=3,
         help="Max retries for transient errors (GPU unavailable, DNS, network). Default: 3",
     )
+    group.addoption(
+        "--fkit-serial-patterns",
+        action="store",
+        type=str,
+        default="test_multi_gpu_data_parallel_forward",
+        help="Comma-separated test name patterns that must run one-at-a-time across workers "
+             "(prevents concurrent NCCL/RCCL communicator init collisions). "
+             "Default: test_multi_gpu_data_parallel_forward",
+    )
 
 
 def pytest_configure(config):
@@ -117,6 +126,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "fkit_single_gpu: Mark test as requiring only single GPU"
+    )
+    config.addinivalue_line(
+        "markers",
+        "fkit_serial: Serialize this test across workers (prevents concurrent NCCL/RCCL init)"
     )
 
     # Only register if enabled
@@ -1061,7 +1074,7 @@ class _ScheduledWorkerPool:
     def __init__(self, num_workers: int, gpu_allocations: List[str],
                  gpu_vendor: str, timeout: int, result_callback: Callable,
                  threads_per_worker: int = 4, max_retries: int = 3,
-                 dead_workers=None):
+                 dead_workers=None, serial_patterns: List[str] = None):
         self.num_workers = num_workers
         self.gpu_allocations = gpu_allocations
         self.gpu_vendor = gpu_vendor
@@ -1109,6 +1122,14 @@ class _ScheduledWorkerPool:
         # Control
         self._shutdown = threading.Event()
         self._workers: List[threading.Thread] = []
+
+        # NCCL/RCCL serialization gate.
+        # Tests matching serial_patterns run one-at-a-time across all
+        # workers to prevent concurrent ncclCommInitAll collisions
+        # (RCCL Error 5: invalid usage).  Other tests run in parallel.
+        self._serial_lock = threading.Lock()
+        self._serial_patterns = serial_patterns or []
+        self._serial_nodeids: set = set()
 
         # System-wide GPU crash barrier.
         # When any worker detects a crash, ALL workers must pause for a
@@ -1419,6 +1440,15 @@ class _ScheduledWorkerPool:
                 time.sleep(0.1)
                 continue
 
+            # --- Serialization gate for NCCL/RCCL-sensitive tests ---
+            # Tests matching serial patterns run one-at-a-time across all
+            # workers to prevent concurrent ncclCommInitAll collisions.
+            nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+            is_serial = (nodeid in self._serial_nodeids
+                         or any(p in nodeid for p in self._serial_patterns))
+            if is_serial:
+                self._serial_lock.acquire()
+
             # --- Execute with finally-guard ---
             # If anything between get_work and report_result throws,
             # the finally block releases the test back to the queue.
@@ -1581,6 +1611,8 @@ class _ScheduledWorkerPool:
                 break
 
             finally:
+                if is_serial:
+                    self._serial_lock.release()
                 # Safety net: if report_result was never called, the test
                 # is still IN_FLIGHT.  Release it back to QUEUED so another
                 # worker (or drain_unresolved) can handle it.
@@ -1747,10 +1779,23 @@ class _ScheduledWorkerPool:
     # Public API (same interface for both modes)
     # ------------------------------------------------------------------
 
+    def _classify_serial_tests(self, items: List):
+        """Identify tests that must run serialized (one-at-a-time)."""
+        for item in items:
+            nodeid = item.nodeid if hasattr(item, 'nodeid') else str(item)
+            if hasattr(item, 'get_closest_marker') and item.get_closest_marker('fkit_serial'):
+                self._serial_nodeids.add(nodeid)
+            elif any(p in nodeid for p in self._serial_patterns):
+                self._serial_nodeids.add(nodeid)
+        if self._serial_nodeids:
+            print(f"   🔒 {len(self._serial_nodeids)} tests will be serialized "
+                  f"(NCCL/RCCL collision prevention)")
+
     def submit_tests(self, items: List):
         """Submit all tests into the scheduler's shared work queue."""
         print(f"\n📊 Submitting {len(items)} tests to shared scheduler "
               f"({self.num_workers} workers)")
+        self._classify_serial_tests(items)
         self.scheduler.submit(items)
 
     def start(self):
@@ -1845,7 +1890,7 @@ class SlicedWorkerPool(_ScheduledWorkerPool):
               f"shared-queue scheduling):")
         for i, s in enumerate(slices):
             print(f"   Worker {i}: {len(s)} tests (initial)")
-        # All tests go into the shared scheduler queue
+        self._classify_serial_tests(items)
         self.scheduler.submit(items)
 
 
@@ -1893,6 +1938,10 @@ class CrashIsolationPlugin:
             self.gpus_per_worker
         )
         
+        # NCCL/RCCL serialization patterns
+        serial_opt = config.getoption('--fkit-serial-patterns', '')
+        self.serial_patterns = [p.strip() for p in serial_opt.split(',') if p.strip()]
+
         # For parallel execution
         self._collected_items = []
         self._item_map = {}
@@ -2166,6 +2215,7 @@ class CrashIsolationPlugin:
                 threads_per_worker=self.threads_per_worker,
                 max_retries=self.max_retries,
                 dead_workers=dead_workers,
+                serial_patterns=self.serial_patterns,
             )
         else:
             # Dynamic mode: tests are assigned to workers on-demand
@@ -2182,6 +2232,7 @@ class CrashIsolationPlugin:
                 threads_per_worker=self.threads_per_worker,
                 max_retries=self.max_retries,
                 dead_workers=dead_workers,
+                serial_patterns=self.serial_patterns,
             )
         
         # Submit all tests (sliced or queued depending on pool type)
