@@ -1896,7 +1896,7 @@ class SlicedWorkerPool(_ScheduledWorkerPool):
 
 class CrashIsolationPlugin:
     """Plugin that runs tests in subprocess workers to catch crashes."""
-    
+
     def __init__(self, config):
         self.config = config
         self.timeout = config.getoption("--fkit-timeout")
@@ -1904,13 +1904,50 @@ class CrashIsolationPlugin:
         self.execution_mode = config.getoption("--fkit-mode")
         self.max_retries = config.getoption("--fkit-max-retries")
         threads_per_worker_opt = config.getoption("--fkit-threads-per-worker")
-        
+
         # Parse worker count
         workers_opt = config.getoption("--fkit-workers")
-        
-        # Detect GPUs and CPUs
+
+        # Detect GPUs and CPUs (uses subprocesses, no CUDA init in parent)
         self.gpu_info = detect_gpus()
         self.cpu_info = detect_cpus()
+
+        # Prevent CUDA/HIP context poisoning in the parent process.
+        #
+        # Problem: pytest collection imports test modules, which apply
+        # decorators like @require_torch_multi_gpu.  These call
+        # torch.cuda.device_count() EAGERLY (at decoration time), which
+        # initializes a CUDA/HIP context in the parent process for ALL
+        # visible GPUs.
+        #
+        # When fkit later spawns subprocesses (fork+exec), the forked
+        # child briefly inherits the parent's GPU associations.  On some
+        # ROCm kernels/drivers, the KFD (Kernel Fusion Driver) doesn't
+        # fully clean up fork-inherited GPU state after exec(), causing
+        # RCCL's ncclCommInitAll to fail with "NCCL Error 5: invalid
+        # usage" (duplicate GPU detected).
+        #
+        # Fix: monkey-patch torch.cuda.device_count() and is_available()
+        # to return the correct values (from our subprocess-based GPU
+        # detection) WITHOUT initializing the HIP/CUDA context.  This
+        # lets decorators evaluate correctly during collection while
+        # keeping the parent process GPU-context-free.  The patches are
+        # removed before test execution (subprocesses get unpatched torch).
+        self._torch_patches = {}
+        try:
+            import torch
+            gpu_count = self.gpu_info.count
+            has_gpus = gpu_count > 0
+
+            if hasattr(torch, 'cuda'):
+                self._torch_patches['device_count'] = torch.cuda.device_count
+                self._torch_patches['is_available'] = torch.cuda.is_available
+                torch.cuda.device_count = lambda: gpu_count
+                torch.cuda.is_available = lambda: has_gpus
+                print(f"   [fkit] Patched torch.cuda for safe collection "
+                      f"(device_count→{gpu_count}, no HIP context init)")
+        except ImportError:
+            pass
         
         if workers_opt == 'auto':
             # Auto-detect based on GPUs
@@ -2190,10 +2227,21 @@ class CrashIsolationPlugin:
         """Override test loop for parallel execution with sliced or dynamic scheduling."""
         if not self._parallel_mode:
             return None
-        
+
         if not self._collected_items:
             return None
-        
+
+        # Restore original torch.cuda functions now that collection is done.
+        # Subprocesses get unpatched torch via fresh Python process.
+        try:
+            import torch
+            if 'device_count' in self._torch_patches:
+                torch.cuda.device_count = self._torch_patches['device_count']
+            if 'is_available' in self._torch_patches:
+                torch.cuda.is_available = self._torch_patches['is_available']
+        except ImportError:
+            pass
+
         # Choose worker pool based on execution mode
         dead_workers = getattr(self, '_preflight_dead_workers', None)
         dead_count = len(dead_workers) if dead_workers else 0
